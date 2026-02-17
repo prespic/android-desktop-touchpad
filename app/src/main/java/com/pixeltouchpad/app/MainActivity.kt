@@ -1,6 +1,9 @@
 package com.pixeltouchpad.app
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
@@ -10,6 +13,7 @@ import android.view.Display
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import rikka.shizuku.Shizuku
 
@@ -30,6 +34,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var btnConnect: Button
     private lateinit var btnDiagnose: Button
+    private lateinit var btnCopy: Button
+    private lateinit var btnShare: Button
+    private var lastDiagnosticOutput: String? = null
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -93,12 +100,18 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         btnConnect = findViewById(R.id.btnConnect)
         btnDiagnose = findViewById(R.id.btnDiagnose)
+        btnCopy = findViewById(R.id.btnCopy)
+        btnShare = findViewById(R.id.btnShare)
 
         touchpadView.visibility = View.GONE
         btnDiagnose.visibility = View.GONE
+        btnCopy.visibility = View.GONE
+        btnShare.visibility = View.GONE
 
         btnConnect.setOnClickListener { startSetup() }
         btnDiagnose.setOnClickListener { runDiagnose() }
+        btnCopy.setOnClickListener { copyDiagnostics() }
+        btnShare.setOnClickListener { shareDiagnostics() }
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
 
@@ -233,11 +246,39 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 val result = inputService?.diagnose() ?: "Služba není připojena"
-                runOnUiThread { updateStatus(result) }
+                lastDiagnosticOutput = result
+                runOnUiThread {
+                    updateStatus(result)
+                    btnCopy.visibility = View.VISIBLE
+                    btnShare.visibility = View.VISIBLE
+                }
             } catch (e: Exception) {
-                runOnUiThread { updateStatus("Diagnostika selhala: ${e.message}") }
+                val error = "Diagnostika selhala: ${e.message}"
+                lastDiagnosticOutput = error
+                runOnUiThread {
+                    updateStatus(error)
+                    btnCopy.visibility = View.VISIBLE
+                    btnShare.visibility = View.VISIBLE
+                }
             }
         }.start()
+    }
+
+    private fun copyDiagnostics() {
+        val text = lastDiagnosticOutput ?: return
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard.setPrimaryClip(ClipData.newPlainText("PixelTouchpad Diagnostics", text))
+        Toast.makeText(this, "Zkopírováno do schránky", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun shareDiagnostics() {
+        val text = lastDiagnosticOutput ?: return
+        val intent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "PixelTouchpad Diagnostics")
+            putExtra(Intent.EXTRA_TEXT, text)
+        }
+        startActivity(Intent.createChooser(intent, "Sdílet diagnostiku"))
     }
 
     private fun updateStatus(text: String) {
