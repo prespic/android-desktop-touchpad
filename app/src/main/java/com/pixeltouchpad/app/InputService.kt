@@ -5,66 +5,72 @@ import android.os.SystemClock
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.MotionEvent
+import java.lang.reflect.Method
 
 /**
- * Shizuku UserService - runs in a separate process with shell (ADB) privileges.
- * Injects mouse input events via InputManager on the target display.
- *
- * IMPORTANT: This class must NOT reference any Activity, Context, or UI classes.
- * It runs as a standalone process managed by Shizuku.
+ * Shizuku UserService - runs with shell (ADB) privileges.
+ * Tries InputManager API first, falls back to shell commands.
  */
 class InputService : IInputService.Stub() {
 
-    companion object {
-        private const val INJECT_MODE_ASYNC = 0
-    }
+    private var useShellFallback = false
+    private val errors = mutableListOf<String>()
 
-    private val inputManager: Any? by lazy {
+    // ---- InputManager reflection ----
+
+    private var imInstance: Any? = null
+    private var injectMethod: Method? = null
+    private var setDisplayIdMethod: Method? = null
+
+    init {
         try {
-            InputManager::class.java
+            imInstance = InputManager::class.java
                 .getDeclaredMethod("getInstance")
                 .invoke(null)
+            errors.add("✓ InputManager.getInstance() OK")
         } catch (e: Exception) {
-            null
+            errors.add("✗ InputManager.getInstance(): ${e.message}")
+            useShellFallback = true
         }
-    }
 
-    private val injectMethod by lazy {
         try {
-            InputManager::class.java.getDeclaredMethod(
+            injectMethod = InputManager::class.java.getDeclaredMethod(
                 "injectInputEvent",
                 InputEvent::class.java,
                 Int::class.javaPrimitiveType
             )
+            errors.add("✓ injectInputEvent method found")
         } catch (e: Exception) {
-            null
+            errors.add("✗ injectInputEvent: ${e.message}")
+            useShellFallback = true
         }
-    }
 
-    private val setDisplayIdMethod by lazy {
         try {
-            InputEvent::class.java.getDeclaredMethod(
+            setDisplayIdMethod = InputEvent::class.java.getDeclaredMethod(
                 "setDisplayId",
                 Int::class.javaPrimitiveType
             )
+            errors.add("✓ setDisplayId method found")
         } catch (e: Exception) {
-            null
+            errors.add("✗ setDisplayId: ${e.message}")
+            // Not fatal - we can try without it
         }
+
+        errors.add(if (useShellFallback) "→ Using SHELL fallback" else "→ Using InputManager API")
     }
 
-    /**
-     * Injects a MotionEvent with SOURCE_MOUSE on the specified display.
-     */
-    private fun injectMotionEvent(
+    // ---- InputManager injection ----
+
+    private fun injectViaInputManager(
         displayId: Int,
         action: Int,
         x: Float,
         y: Float,
         buttonState: Int = 0,
         vScroll: Float = 0f
-    ) {
-        val im = inputManager ?: return
-        val inject = injectMethod ?: return
+    ): Boolean {
+        val im = imInstance ?: return false
+        val inject = injectMethod ?: return false
 
         val now = SystemClock.uptimeMillis()
 
@@ -80,8 +86,7 @@ class InputService : IInputService.Stub() {
                 this.x = x
                 this.y = y
                 pressure = if (action == MotionEvent.ACTION_HOVER_MOVE ||
-                    action == MotionEvent.ACTION_SCROLL
-                ) 0f else 1f
+                    action == MotionEvent.ACTION_SCROLL) 0f else 1f
                 size = 1f
                 if (vScroll != 0f) {
                     setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
@@ -90,81 +95,110 @@ class InputService : IInputService.Stub() {
         )
 
         val event = MotionEvent.obtain(
-            /* downTime */ now,
-            /* eventTime */ now,
-            /* action */ action,
-            /* pointerCount */ 1,
-            /* pointerProperties */ properties,
-            /* pointerCoords */ coords,
-            /* metaState */ 0,
-            /* buttonState */ buttonState,
-            /* xPrecision */ 1.0f,
-            /* yPrecision */ 1.0f,
-            /* deviceId */ 0,
-            /* edgeFlags */ 0,
-            /* source */ InputDevice.SOURCE_MOUSE,
-            /* flags */ 0
+            now, now, action, 1,
+            properties, coords,
+            0, buttonState,
+            1.0f, 1.0f, 0, 0,
+            InputDevice.SOURCE_MOUSE, 0
         )
 
-        // Set the target display
         try {
             setDisplayIdMethod?.invoke(event, displayId)
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) {}
 
-        // Inject
-        try {
-            inject.invoke(im, event, INJECT_MODE_ASYNC)
-        } catch (_: Exception) {
+        return try {
+            val result = inject.invoke(im, event, 2) // 2 = INJECT_INPUT_EVENT_MODE_ASYNC
+            event.recycle()
+            result as? Boolean ?: false
+        } catch (e: Exception) {
+            event.recycle()
+            if (errors.size < 20) errors.add("inject fail: ${e.cause?.message ?: e.message}")
+            false
         }
-
-        event.recycle()
     }
 
-    // ---- IInputService AIDL implementation ----
+    // ---- Shell command fallback ----
+
+    private fun shellMove(displayId: Int, x: Float, y: Float) {
+        try {
+            val cmd = "input -d $displayId motionevent HOVER_MOVE ${x.toInt()} ${y.toInt()}"
+            Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+        } catch (_: Exception) {
+            // Try without -d flag
+            try {
+                val cmd = "input motionevent HOVER_MOVE ${x.toInt()} ${y.toInt()}"
+                Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun shellTap(displayId: Int, x: Float, y: Float) {
+        try {
+            val cmd = "input -d $displayId tap ${x.toInt()} ${y.toInt()}"
+            Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+        } catch (_: Exception) {
+            try {
+                val cmd = "input tap ${x.toInt()} ${y.toInt()}"
+                Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd)).waitFor()
+            } catch (_: Exception) {}
+        }
+    }
+
+    // ---- AIDL implementation ----
 
     override fun moveCursor(displayId: Int, x: Float, y: Float) {
-        injectMotionEvent(
-            displayId = displayId,
-            action = MotionEvent.ACTION_HOVER_MOVE,
-            x = x,
-            y = y
-        )
+        if (!useShellFallback) {
+            val ok = injectViaInputManager(displayId, MotionEvent.ACTION_HOVER_MOVE, x, y)
+            if (!ok && !useShellFallback) {
+                useShellFallback = true
+                errors.add("! InputManager inject returned false, switching to shell")
+            }
+        }
+        if (useShellFallback) {
+            shellMove(displayId, x, y)
+        }
     }
 
     override fun click(displayId: Int, x: Float, y: Float) {
-        val now = SystemClock.uptimeMillis()
-        // ACTION_DOWN
-        injectMotionEvent(
-            displayId = displayId,
-            action = MotionEvent.ACTION_DOWN,
-            x = x,
-            y = y,
-            buttonState = MotionEvent.BUTTON_PRIMARY
-        )
-        // Small delay for realism
-        try { Thread.sleep(16) } catch (_: Exception) {}
-        // ACTION_UP
-        injectMotionEvent(
-            displayId = displayId,
-            action = MotionEvent.ACTION_UP,
-            x = x,
-            y = y,
-            buttonState = 0
-        )
+        if (!useShellFallback) {
+            injectViaInputManager(displayId, MotionEvent.ACTION_DOWN, x, y,
+                buttonState = MotionEvent.BUTTON_PRIMARY)
+            try { Thread.sleep(16) } catch (_: Exception) {}
+            injectViaInputManager(displayId, MotionEvent.ACTION_UP, x, y, buttonState = 0)
+        } else {
+            shellTap(displayId, x, y)
+        }
     }
 
     override fun scroll(displayId: Int, x: Float, y: Float, vScroll: Float) {
-        injectMotionEvent(
-            displayId = displayId,
-            action = MotionEvent.ACTION_SCROLL,
-            x = x,
-            y = y,
-            vScroll = vScroll
-        )
+        if (!useShellFallback) {
+            injectViaInputManager(displayId, MotionEvent.ACTION_SCROLL, x, y, vScroll = vScroll)
+        }
+        // Shell fallback for scroll is unreliable, skip for now
     }
 
-    override fun destroy() {
-        // Nothing to clean up
+    override fun diagnose(): String {
+        val sb = StringBuilder()
+        sb.appendLine("=== PixelTouchpad Diagnostics ===")
+        sb.appendLine("Process UID: ${android.os.Process.myUid()}")
+        sb.appendLine("Process PID: ${android.os.Process.myPid()}")
+        sb.appendLine("Shell fallback: $useShellFallback")
+        sb.appendLine()
+        sb.appendLine("--- Init log ---")
+        errors.forEach { sb.appendLine(it) }
+
+        // Test injection on display 0
+        sb.appendLine()
+        sb.appendLine("--- Live test (display 0) ---")
+        try {
+            val result = injectViaInputManager(0, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
+            sb.appendLine("Test inject result: $result")
+        } catch (e: Exception) {
+            sb.appendLine("Test inject exception: ${e.message}")
+        }
+
+        return sb.toString()
     }
+
+    override fun destroy() {}
 }

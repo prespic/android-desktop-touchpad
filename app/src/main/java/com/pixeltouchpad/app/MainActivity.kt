@@ -19,21 +19,17 @@ class MainActivity : AppCompatActivity() {
         private const val SHIZUKU_PERMISSION_CODE = 1001
     }
 
-    // Shizuku service
     private var inputService: IInputService? = null
     private var isServiceBound = false
 
-    // Display info
     private var externalDisplayId: Int = -1
     private var externalWidth = 1920f
     private var externalHeight = 1080f
 
-    // Views
     private lateinit var touchpadView: TouchpadView
     private lateinit var statusText: TextView
     private lateinit var btnConnect: Button
-
-    // ---- Shizuku UserService connection ----
+    private lateinit var btnDiagnose: Button
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -59,8 +55,6 @@ class MainActivity : AppCompatActivity() {
             .version(BuildConfig.VERSION_CODE)
     }
 
-    // ---- Shizuku permission listener ----
-
     private val permissionResultListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
             if (requestCode == SHIZUKU_PERMISSION_CODE) {
@@ -71,8 +65,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-
-    // ---- Display listener ----
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {
@@ -93,8 +85,6 @@ class MainActivity : AppCompatActivity() {
         override fun onDisplayChanged(displayId: Int) {}
     }
 
-    // ---- Lifecycle ----
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -102,40 +92,44 @@ class MainActivity : AppCompatActivity() {
         touchpadView = findViewById(R.id.touchpadView)
         statusText = findViewById(R.id.statusText)
         btnConnect = findViewById(R.id.btnConnect)
+        btnDiagnose = findViewById(R.id.btnDiagnose)
 
         touchpadView.visibility = View.GONE
+        btnDiagnose.visibility = View.GONE
 
         btnConnect.setOnClickListener { startSetup() }
+        btnDiagnose.setOnClickListener { runDiagnose() }
 
-        // Register listeners
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
 
         val dm = getSystemService(DisplayManager::class.java)
         dm.registerDisplayListener(displayListener, null)
 
-        // Wire touchpad callbacks
+        // Touchpad callbacks
         touchpadView.onCursorMove = { x, y ->
             try {
                 inputService?.moveCursor(externalDisplayId, x, y)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                runOnUiThread { updateStatus("Move error: ${e.message}") }
             }
         }
 
         touchpadView.onClick = { x, y ->
             try {
                 inputService?.click(externalDisplayId, x, y)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                runOnUiThread { updateStatus("Click error: ${e.message}") }
             }
         }
 
         touchpadView.onScroll = { x, y, vScroll ->
             try {
                 inputService?.scroll(externalDisplayId, x, y, vScroll)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                runOnUiThread { updateStatus("Scroll error: ${e.message}") }
             }
         }
 
-        // Auto-start if Shizuku is already running
         if (Shizuku.pingBinder()) {
             startSetup()
         } else {
@@ -152,12 +146,9 @@ class MainActivity : AppCompatActivity() {
         if (isServiceBound) {
             try {
                 Shizuku.unbindUserService(userServiceArgs, serviceConnection, true)
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
         }
     }
-
-    // ---- Setup flow ----
 
     private fun startSetup() {
         if (!Shizuku.pingBinder()) {
@@ -191,52 +182,63 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onServiceReady() {
+        btnDiagnose.visibility = View.VISIBLE
         updateStatus("Služba připojena. Hledám externí displej...")
         detectExternalDisplay()
     }
-
-    // ---- Display detection ----
 
     private fun detectExternalDisplay() {
         val dm = getSystemService(DisplayManager::class.java)
         val displays = dm.displays
 
-        val external = displays.firstOrNull { display ->
-            display.displayId != Display.DEFAULT_DISPLAY
+        // List all displays for debugging
+        val displayInfo = displays.joinToString("\n") { d ->
+            val mode = d.mode
+            "  #${d.displayId}: ${d.name} (${mode.physicalWidth}×${mode.physicalHeight})"
         }
+
+        val external = displays.firstOrNull { it.displayId != Display.DEFAULT_DISPLAY }
 
         if (external != null) {
             externalDisplayId = external.displayId
-
-            // Get display size
             val mode = external.mode
             externalWidth = mode.physicalWidth.toFloat()
             externalHeight = mode.physicalHeight.toFloat()
 
-            // Configure touchpad
             touchpadView.displayWidth = externalWidth
             touchpadView.displayHeight = externalHeight
             touchpadView.resetCursor()
 
-            // Show touchpad
             touchpadView.visibility = View.VISIBLE
             btnConnect.visibility = View.GONE
             updateStatus(
                 "Displej #$externalDisplayId (${externalWidth.toInt()}×${externalHeight.toInt()})\n" +
-                        "Touchpad aktivní"
+                "Touchpad aktivní\n\n" +
+                "Pokud kurzor nereaguje, klikni Diagnostika\n\n" +
+                "Nalezené displeje:\n$displayInfo"
             )
         } else {
-            externalDisplayId = -1
             touchpadView.visibility = View.GONE
             btnConnect.visibility = View.VISIBLE
             updateStatus(
-                "Služba běží, ale žádný externí displej nenalezen.\n\n" +
-                        "Připoj monitor přes USB-C kabel."
+                "Žádný externí displej nenalezen.\n" +
+                "Připoj monitor přes USB-C.\n\n" +
+                "Nalezené displeje:\n$displayInfo"
             )
         }
     }
 
-    // ---- UI helpers ----
+    private fun runDiagnose() {
+        updateStatus("Spouštím diagnostiku...")
+        Thread {
+            try {
+                val result = inputService?.diagnose() ?: "Služba není připojena"
+                runOnUiThread { updateStatus(result) }
+            } catch (e: Exception) {
+                runOnUiThread { updateStatus("Diagnostika selhala: ${e.message}") }
+            }
+        }.start()
+    }
 
     private fun updateStatus(text: String) {
         statusText.text = text
