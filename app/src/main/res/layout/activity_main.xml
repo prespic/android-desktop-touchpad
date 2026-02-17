@@ -59,15 +59,23 @@
                 android:layout_marginStart="8dp"
                 android:backgroundTint="#e94560"
                 android:visibility="gone" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/diagActionRow"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="6dp"
+            android:visibility="gone">
 
             <Button
                 android:id="@+id/btnCopy"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Kopírovat"
-                android:layout_marginStart="8dp"
-                android:backgroundTint="#1a1a2e"
-                android:visibility="gone" />
+                android:backgroundTint="#16213e"
+                style="?attr/materialButtonOutlinedStyle" />
 
             <Button
                 android:id="@+id/btnShare"
@@ -75,8 +83,8 @@
                 android:layout_height="wrap_content"
                 android:text="Sdílet"
                 android:layout_marginStart="8dp"
-                android:backgroundTint="#1a1a2e"
-                android:visibility="gone" />
+                android:backgroundTint="#16213e"
+                style="?attr/materialButtonOutlinedStyle" />
         </LinearLayout>
     </LinearLayout>
 
