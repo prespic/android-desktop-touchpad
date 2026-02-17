@@ -261,7 +261,7 @@ class MainActivity : AppCompatActivity() {
         updateStatus("Spouštím diagnostiku...")
         Thread {
             try {
-                val result = inputService?.diagnose() ?: "Služba není připojena"
+                val result = inputService?.diagnose(externalDisplayId) ?: "Služba není připojena"
                 lastDiagnosticOutput = result
                 runOnUiThread {
                     updateStatus(result)
