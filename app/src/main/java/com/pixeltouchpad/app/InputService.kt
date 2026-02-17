@@ -1,173 +1,197 @@
 package com.pixeltouchpad.app
 
-import android.hardware.input.InputManager
-import android.os.SystemClock
-import android.view.InputDevice
-import android.view.InputEvent
 import android.view.MotionEvent
 import java.io.File
-import java.lang.reflect.Method
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
  * Shizuku UserService - runs with shell (ADB) privileges.
+ *
+ * Uses /dev/uhid to create a virtual HID mouse device.
+ * This is the only reliable way to move the system cursor
+ * in Android desktop mode — injected MotionEvents only
+ * deliver to windows but don't move the pointer.
  */
 class InputService : IInputService.Stub() {
 
     private val initLog = mutableListOf<String>()
 
-    // ---- Reflection handles ----
-    private var imGlobalInstance: Any? = null
-    private var inject2Method: Method? = null  // (InputEvent, int mode)
-    private var inject3Method: Method? = null  // (InputEvent, int mode, int targetUid)
-    private var setDisplayIdMethod: Method? = null
+    // ---- UHID virtual mouse ----
 
-    // Discovered working configuration
-    private var workingMode = 0  // 0=WAIT_FOR_RESULT (works!), 2=ASYNC
-    private var workingUid = -1  // for 3-arg inject
-    private var useInject3 = false
-    private var configDiscovered = false
+    private var uhidFd: FileOutputStream? = null
+    private var uhidReady = false
+
+    // Track previous absolute position to compute deltas
+    private var prevX = Float.NaN
+    private var prevY = Float.NaN
+
+    companion object {
+        // UHID event types
+        private const val UHID_CREATE2 = 11
+        private const val UHID_INPUT2 = 12
+        private const val UHID_DESTROY = 1
+
+        private const val BUS_VIRTUAL: Short = 0x06
+
+        // Total size of uhid_create2_req struct
+        // name(128) + phys(64) + uniq(64) + rd_size(2) + bus(2) + vendor(4)
+        // + product(4) + version(4) + country(4) + rd_data(4096) = 4372
+        private const val CREATE2_REQ_SIZE = 4372
+        private const val UHID_EVENT_HEADER = 4  // uint32 type
+
+        // HID Report Descriptor: 3-button relative mouse with wheel
+        // Report format: [buttons(1)] [X(1)] [Y(1)] [wheel(1)] = 4 bytes
+        private val HID_MOUSE_DESCRIPTOR = byteArrayOf(
+            0x05, 0x01,                   // Usage Page (Generic Desktop)
+            0x09, 0x02,                   // Usage (Mouse)
+            0xA1.toByte(), 0x01,          // Collection (Application)
+            0x09, 0x01,                   //   Usage (Pointer)
+            0xA1.toByte(), 0x00,          //   Collection (Physical)
+            // Buttons
+            0x05, 0x09,                   //     Usage Page (Button)
+            0x19, 0x01,                   //     Usage Minimum (1)
+            0x29, 0x03,                   //     Usage Maximum (3)
+            0x15, 0x00,                   //     Logical Minimum (0)
+            0x25, 0x01,                   //     Logical Maximum (1)
+            0x95.toByte(), 0x03,          //     Report Count (3)
+            0x75, 0x01,                   //     Report Size (1)
+            0x81.toByte(), 0x02,          //     Input (Data,Var,Abs)
+            // Padding (5 bits)
+            0x95.toByte(), 0x01,          //     Report Count (1)
+            0x75, 0x05,                   //     Report Size (5)
+            0x81.toByte(), 0x01,          //     Input (Cnst)
+            // X, Y, Wheel (relative)
+            0x05, 0x01,                   //     Usage Page (Generic Desktop)
+            0x09, 0x30,                   //     Usage (X)
+            0x09, 0x31,                   //     Usage (Y)
+            0x09, 0x38,                   //     Usage (Wheel)
+            0x15, 0x81.toByte(),          //     Logical Minimum (-127)
+            0x25, 0x7F,                   //     Logical Maximum (127)
+            0x75, 0x08,                   //     Report Size (8)
+            0x95.toByte(), 0x03,          //     Report Count (3)
+            0x81.toByte(), 0x06,          //     Input (Data,Var,Rel)
+            0xC0.toByte(),                //   End Collection
+            0xC0.toByte()                 // End Collection
+        )
+    }
 
     init {
+        // Try to create UHID mouse
         try {
-            setDisplayIdMethod = InputEvent::class.java.getDeclaredMethod(
-                "setDisplayId", Int::class.javaPrimitiveType
-            )
-            initLog.add("✓ setDisplayId")
-        } catch (e: Exception) {
-            initLog.add("✗ setDisplayId: ${e.message}")
-        }
-
-        // InputManagerGlobal
-        try {
-            val imgClass = Class.forName("android.hardware.input.InputManagerGlobal")
-            imGlobalInstance = imgClass.getDeclaredMethod("getInstance").invoke(null)
-            initLog.add("✓ InputManagerGlobal")
-
-            try {
-                inject2Method = imgClass.getDeclaredMethod(
-                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType
-                )
-                initLog.add("✓ inject2")
-            } catch (_: Exception) {}
-
-            try {
-                inject3Method = imgClass.getDeclaredMethod(
-                    "injectInputEvent", InputEvent::class.java,
-                    Int::class.javaPrimitiveType, Int::class.javaPrimitiveType
-                )
-                initLog.add("✓ inject3")
-            } catch (_: Exception) {}
-        } catch (e: Exception) {
-            initLog.add("✗ InputManagerGlobal: ${e.cause?.message ?: e.message}")
-            // Legacy fallback
-            try {
-                imGlobalInstance = InputManager::class.java
-                    .getDeclaredMethod("getInstance").invoke(null)
-                inject2Method = InputManager::class.java.getDeclaredMethod(
-                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType
-                )
-                initLog.add("✓ InputManager legacy")
-            } catch (e2: Exception) {
-                initLog.add("✗ legacy: ${e2.cause?.message ?: e2.message}")
+            val uhidFile = File("/dev/uhid")
+            if (uhidFile.exists() && uhidFile.canWrite()) {
+                uhidFd = FileOutputStream(uhidFile)
+                createUhidDevice()
+                initLog.add("✓ /dev/uhid opened")
+            } else {
+                initLog.add("✗ /dev/uhid not writable")
+                // Try /dev/uinput as alternative check
+                val uinputFile = File("/dev/uinput")
+                initLog.add("  /dev/uinput exists:${uinputFile.exists()} canWrite:${uinputFile.canWrite()}")
             }
+        } catch (e: Exception) {
+            initLog.add("✗ uhid init: ${e.message}")
         }
     }
 
-    // ---- MotionEvent builder ----
+    private fun createUhidDevice() {
+        val fd = uhidFd ?: return
 
-    private fun buildMouseEvent(
-        displayId: Int, action: Int, x: Float, y: Float,
-        buttonState: Int = 0, vScroll: Float = 0f
-    ): MotionEvent {
-        val now = SystemClock.uptimeMillis()
-        val props = arrayOf(MotionEvent.PointerProperties().apply {
-            id = 0; toolType = MotionEvent.TOOL_TYPE_MOUSE
-        })
-        val coords = arrayOf(MotionEvent.PointerCoords().apply {
-            this.x = x; this.y = y
-            pressure = if (action == MotionEvent.ACTION_HOVER_MOVE ||
-                action == MotionEvent.ACTION_SCROLL) 0f else 1f
-            size = 1f
-            if (vScroll != 0f) setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
-        })
-        val event = MotionEvent.obtain(now, now, action, 1, props, coords,
-            0, buttonState, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0)
-        try { setDisplayIdMethod?.invoke(event, displayId) } catch (_: Exception) {}
-        return event
+        // Build UHID_CREATE2 event
+        val totalSize = UHID_EVENT_HEADER + CREATE2_REQ_SIZE
+        val buf = ByteBuffer.allocate(totalSize)
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+
+        // Event type
+        buf.putInt(UHID_CREATE2)
+
+        // name (128 bytes, null-padded)
+        val name = "PixelTouchpad Mouse".toByteArray(Charsets.UTF_8)
+        buf.put(name, 0, minOf(name.size, 127))
+        buf.position(UHID_EVENT_HEADER + 128)
+
+        // phys (64 bytes) - skip
+        buf.position(UHID_EVENT_HEADER + 128 + 64)
+
+        // uniq (64 bytes) - skip
+        buf.position(UHID_EVENT_HEADER + 128 + 64 + 64)
+
+        // rd_size (uint16)
+        buf.putShort(HID_MOUSE_DESCRIPTOR.size.toShort())
+
+        // bus (uint16)
+        buf.putShort(BUS_VIRTUAL)
+
+        // vendor (uint32)
+        buf.putInt(0x1234)
+
+        // product (uint32)
+        buf.putInt(0x5678)
+
+        // version (uint32)
+        buf.putInt(1)
+
+        // country (uint32)
+        buf.putInt(0)
+
+        // rd_data (4096 bytes, copy descriptor + zero padding)
+        buf.put(HID_MOUSE_DESCRIPTOR)
+        // Rest is already zeroed by ByteBuffer.allocate
+
+        fd.write(buf.array())
+        fd.flush()
+
+        // Give kernel time to register the device
+        Thread.sleep(200)
+
+        uhidReady = true
+        initLog.add("✓ UHID mouse device created")
     }
 
-    // ---- Injection ----
+    private fun sendMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int = 0) {
+        val fd = uhidFd ?: return
+        if (!uhidReady) return
 
-    private fun tryInject(event: MotionEvent, mode: Int): Boolean {
-        val im = imGlobalInstance ?: return false
-        return try {
-            val r = inject2Method?.invoke(im, event, mode) as? Boolean ?: false
-            r
-        } catch (_: Exception) { false }
-    }
+        // UHID_INPUT2: type(4) + size(2) + data(4 bytes for mouse)
+        val buf = ByteBuffer.allocate(10)
+        buf.order(ByteOrder.LITTLE_ENDIAN)
 
-    private fun tryInject3(event: MotionEvent, mode: Int, uid: Int): Boolean {
-        val im = imGlobalInstance ?: return false
-        return try {
-            val r = inject3Method?.invoke(im, event, mode, uid) as? Boolean ?: false
-            r
-        } catch (_: Exception) { false }
+        buf.putInt(UHID_INPUT2)
+        buf.putShort(4) // report size
+        buf.put(buttons.toByte())
+        buf.put(dx.coerceIn(-127, 127).toByte())
+        buf.put(dy.coerceIn(-127, 127).toByte())
+        buf.put(wheel.coerceIn(-127, 127).toByte())
+
+        fd.write(buf.array())
+        fd.flush()
     }
 
     /**
-     * Auto-discover working inject configuration on first call to external display.
+     * Move cursor by relative amount. Handles deltas > 127 by sending multiple reports.
      */
-    private fun discoverConfig(displayId: Int) {
-        if (configDiscovered) return
-        configDiscovered = true
-
-        // Try 2-arg with different modes
-        for (mode in listOf(0, 2, 1)) {
-            val ev = buildMouseEvent(displayId, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
-            val ok = tryInject(ev, mode)
-            ev.recycle()
-            if (ok) {
-                workingMode = mode
-                useInject3 = false
-                initLog.add("✓ FOUND: inject2 mode=$mode on d=$displayId")
-                return
-            }
+    private fun uhidMove(dx: Float, dy: Float) {
+        var rx = dx
+        var ry = dy
+        while (kotlin.math.abs(rx) > 0.5f || kotlin.math.abs(ry) > 0.5f) {
+            val sx = rx.coerceIn(-127f, 127f).toInt()
+            val sy = ry.coerceIn(-127f, 127f).toInt()
+            sendMouseReport(0, sx, sy)
+            rx -= sx
+            ry -= sy
         }
-
-        // Try 3-arg with different modes and UIDs
-        if (inject3Method != null) {
-            for (mode in listOf(0, 2)) {
-                for (uid in listOf(-1, 0, 1000, 2000)) {
-                    val ev = buildMouseEvent(displayId, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
-                    val ok = tryInject3(ev, mode, uid)
-                    ev.recycle()
-                    if (ok) {
-                        workingMode = mode
-                        workingUid = uid
-                        useInject3 = true
-                        initLog.add("✓ FOUND: inject3 mode=$mode uid=$uid on d=$displayId")
-                        return
-                    }
-                }
-            }
-        }
-
-        initLog.add("✗ No working inject config for d=$displayId")
     }
 
-    private fun inject(
-        displayId: Int, action: Int, x: Float, y: Float,
-        buttonState: Int = 0, vScroll: Float = 0f
-    ): Boolean {
-        discoverConfig(displayId)
-        val event = buildMouseEvent(displayId, action, x, y, buttonState, vScroll)
-        val ok = if (useInject3) {
-            tryInject3(event, workingMode, workingUid)
-        } else {
-            tryInject(event, workingMode)
-        }
-        event.recycle()
-        return ok
+    private fun uhidClick(button: Int = 1) {
+        sendMouseReport(button, 0, 0)
+        try { Thread.sleep(16) } catch (_: Exception) {}
+        sendMouseReport(0, 0, 0)
+    }
+
+    private fun uhidScroll(amount: Int) {
+        sendMouseReport(0, 0, 0, amount)
     }
 
     // ---- Shell fallback ----
@@ -183,25 +207,34 @@ class InputService : IInputService.Stub() {
         } catch (e: Exception) { Pair(-1, "Exception: ${e.message}") }
     }
 
-    // ---- AIDL ----
+    // ---- AIDL implementation ----
 
     override fun moveCursor(displayId: Int, x: Float, y: Float) {
-        inject(displayId, MotionEvent.ACTION_HOVER_MOVE, x, y)
+        if (uhidReady) {
+            if (!prevX.isNaN()) {
+                val dx = x - prevX
+                val dy = y - prevY
+                if (kotlin.math.abs(dx) > 0.1f || kotlin.math.abs(dy) > 0.1f) {
+                    uhidMove(dx, dy)
+                }
+            }
+            prevX = x
+            prevY = y
+        }
     }
 
     override fun click(displayId: Int, x: Float, y: Float) {
-        val ok = inject(displayId, MotionEvent.ACTION_DOWN, x, y,
-            buttonState = MotionEvent.BUTTON_PRIMARY)
-        if (ok) {
-            try { Thread.sleep(16) } catch (_: Exception) {}
-            inject(displayId, MotionEvent.ACTION_UP, x, y, buttonState = 0)
+        if (uhidReady) {
+            uhidClick(1) // left button
         } else {
             execShell("input -d $displayId tap ${x.toInt()} ${y.toInt()}")
         }
     }
 
     override fun scroll(displayId: Int, x: Float, y: Float, vScroll: Float) {
-        inject(displayId, MotionEvent.ACTION_SCROLL, x, y, vScroll = vScroll)
+        if (uhidReady) {
+            uhidScroll(vScroll.toInt().coerceIn(-10, 10))
+        }
     }
 
     // ---- DIAGNOSTICS ----
@@ -214,89 +247,86 @@ class InputService : IInputService.Stub() {
         sb.appendLine("External displayId: $externalDisplayId")
         sb.appendLine()
 
-        // Init
         sb.appendLine("-- Init --")
         initLog.forEach { sb.appendLine(it) }
         sb.appendLine()
 
-        // Test actual display IDs
-        val testDisplays = listOf(0, externalDisplayId)
-        sb.appendLine("-- 2-arg inject per display & mode --")
-        for (d in testDisplays) {
-            for (mode in 0..2) {
-                val ev = buildMouseEvent(d, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
-                val r = tryInject(ev, mode)
-                ev.recycle()
-                sb.appendLine("  d=$d mode=$mode HOVER: $r")
-            }
-        }
+        sb.appendLine("-- UHID Status --")
+        sb.appendLine("uhidFd: ${if (uhidFd != null) "open" else "null"}")
+        sb.appendLine("uhidReady: $uhidReady")
+        sb.appendLine("prevX: $prevX prevY: $prevY")
 
+        // Check /dev/uhid
         sb.appendLine()
-        sb.appendLine("-- 3-arg inject (d=$externalDisplayId) --")
-        if (inject3Method != null) {
-            for (mode in listOf(0, 2)) {
-                for (uid in listOf(-1, 0, 1000, 2000, 10000)) {
-                    val ev = buildMouseEvent(externalDisplayId, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
-                    val r = try {
-                        inject3Method!!.invoke(imGlobalInstance, ev, mode, uid)
-                    } catch (e: Exception) { "ERR:${e.cause?.message?.take(30)}" }
-                    ev.recycle()
-                    sb.appendLine("  mode=$mode uid=$uid: $r")
-                }
-            }
-        } else {
-            sb.appendLine("  inject3 not available")
-        }
+        sb.appendLine("-- /dev/uhid --")
+        val uhidFile = File("/dev/uhid")
+        sb.appendLine("exists: ${uhidFile.exists()}")
+        sb.appendLine("canRead: ${uhidFile.canRead()}")
+        sb.appendLine("canWrite: ${uhidFile.canWrite()}")
+        val (_, lsUhid) = execShell("ls -la /dev/uhid 2>&1")
+        sb.appendLine(lsUhid)
+        val (_, lsZUhid) = execShell("ls -Z /dev/uhid 2>&1")
+        sb.appendLine("context: $lsZUhid")
 
-        // Test DOWN too
-        sb.appendLine()
-        sb.appendLine("-- DOWN/UP on d=$externalDisplayId --")
-        for (mode in 0..2) {
-            val down = buildMouseEvent(externalDisplayId, MotionEvent.ACTION_DOWN, 500f, 500f,
-                buttonState = MotionEvent.BUTTON_PRIMARY)
-            val r = tryInject(down, mode)
-            down.recycle()
-            sb.appendLine("  mode=$mode DOWN: $r")
-            if (r) {
-                val up = buildMouseEvent(externalDisplayId, MotionEvent.ACTION_UP, 500f, 500f)
-                tryInject(up, mode)
-                up.recycle()
-            }
-        }
-
-        // Shell on actual display
-        sb.appendLine()
-        sb.appendLine("-- Shell (d=$externalDisplayId) --")
-        val cmds = listOf(
-            "input -d $externalDisplayId tap 100 100",
-            "input -d $externalDisplayId motionevent DOWN 100 100",
-            "input -d $externalDisplayId motionevent MOVE 200 200",
-            "input -d $externalDisplayId motionevent UP 200 200",
-        )
-        for (cmd in cmds) {
-            val (rc, out) = execShell(cmd)
-            val s = if (rc == 0 && out.isEmpty()) "OK" else "rc=$rc ${out.take(50)}"
-            sb.appendLine("  [$s] $cmd")
-        }
-
-        // /dev/uinput
+        // Check /dev/uinput too
         sb.appendLine()
         sb.appendLine("-- /dev/uinput --")
-        val uf = File("/dev/uinput")
-        sb.appendLine("exists:${uf.exists()} canWrite:${uf.canWrite()}")
+        val uinputFile = File("/dev/uinput")
+        sb.appendLine("exists: ${uinputFile.exists()} canWrite: ${uinputFile.canWrite()}")
 
-        // Current config
+        // Check if our device appeared
         sb.appendLine()
-        sb.appendLine("-- Active config --")
-        sb.appendLine("configDiscovered: $configDiscovered")
-        sb.appendLine("useInject3: $useInject3")
-        sb.appendLine("workingMode: $workingMode")
-        sb.appendLine("workingUid: $workingUid")
+        sb.appendLine("-- Input devices --")
+        val (_, devs) = execShell("ls -la /dev/input/ 2>&1")
+        devs.lines().forEach { sb.appendLine("  $it") }
+
+        // Check for our device in /proc/bus/input/devices
+        sb.appendLine()
+        sb.appendLine("-- Registered HID devices --")
+        val (_, hidDevs) = execShell("cat /proc/bus/input/devices 2>&1 | grep -A3 'PixelTouchpad'")
+        if (hidDevs.isNotEmpty()) {
+            sb.appendLine(hidDevs)
+        } else {
+            sb.appendLine("  PixelTouchpad device NOT found in /proc/bus/input/devices")
+            // Show last few entries for debug
+            val (_, lastDevs) = execShell("cat /proc/bus/input/devices 2>&1 | tail -20")
+            sb.appendLine("  (last entries:)")
+            lastDevs.lines().forEach { sb.appendLine("  $it") }
+        }
+
+        // Test live mouse report
+        sb.appendLine()
+        sb.appendLine("-- Live test --")
+        if (uhidReady) {
+            try {
+                sendMouseReport(0, 10, 0)  // small move right
+                sb.appendLine("Sent move(10,0): OK")
+                Thread.sleep(50)
+                sendMouseReport(0, 0, 10)  // small move down
+                sb.appendLine("Sent move(0,10): OK")
+            } catch (e: Exception) {
+                sb.appendLine("Send failed: ${e.message}")
+            }
+        } else {
+            sb.appendLine("UHID not ready, skipping live test")
+        }
 
         sb.appendLine()
         sb.appendLine("=== END ===")
         return sb.toString()
     }
 
-    override fun destroy() {}
+    override fun destroy() {
+        try {
+            if (uhidReady) {
+                val buf = ByteBuffer.allocate(4)
+                buf.order(ByteOrder.LITTLE_ENDIAN)
+                buf.putInt(UHID_DESTROY)
+                uhidFd?.write(buf.array())
+            }
+            uhidFd?.close()
+        } catch (_: Exception) {}
+        uhidFd = null
+        uhidReady = false
+    }
 }
