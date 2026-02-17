@@ -30,6 +30,12 @@ class MainActivity : AppCompatActivity() {
     private var externalWidth = 1920f
     private var externalHeight = 1080f
 
+    // Event counters for debugging
+    private var moveCount = 0L
+    private var clickCount = 0L
+    private var scrollCount = 0L
+    private var lastError: String? = null
+
     private lateinit var touchpadView: TouchpadView
     private lateinit var statusText: TextView
     private lateinit var btnConnect: Button
@@ -118,28 +124,38 @@ class MainActivity : AppCompatActivity() {
         val dm = getSystemService(DisplayManager::class.java)
         dm.registerDisplayListener(displayListener, null)
 
-        // Touchpad callbacks
+        // Touchpad callbacks with event counting
         touchpadView.onCursorMove = { x, y ->
+            moveCount++
             try {
                 inputService?.moveCursor(externalDisplayId, x, y)
             } catch (e: Exception) {
-                runOnUiThread { updateStatus("Move error: ${e.message}") }
+                lastError = "Move: ${e.message}"
+            }
+            if (moveCount % 50 == 0L) {
+                runOnUiThread { updateEventCounter() }
             }
         }
 
         touchpadView.onClick = { x, y ->
+            clickCount++
             try {
                 inputService?.click(externalDisplayId, x, y)
             } catch (e: Exception) {
-                runOnUiThread { updateStatus("Click error: ${e.message}") }
+                lastError = "Click: ${e.message}"
             }
+            runOnUiThread { updateEventCounter() }
         }
 
         touchpadView.onScroll = { x, y, vScroll ->
+            scrollCount++
             try {
                 inputService?.scroll(externalDisplayId, x, y, vScroll)
             } catch (e: Exception) {
-                runOnUiThread { updateStatus("Scroll error: ${e.message}") }
+                lastError = "Scroll: ${e.message}"
+            }
+            if (scrollCount % 10 == 0L) {
+                runOnUiThread { updateEventCounter() }
             }
         }
 
@@ -279,6 +295,13 @@ class MainActivity : AppCompatActivity() {
             putExtra(Intent.EXTRA_TEXT, text)
         }
         startActivity(Intent.createChooser(intent, "Sdílet diagnostiku"))
+    }
+
+    private fun updateEventCounter() {
+        val err = if (lastError != null) "\nErr: $lastError" else ""
+        val svc = if (inputService != null) "connected" else "NULL"
+        statusText.text = "Move: $moveCount | Click: $clickCount | Scroll: $scrollCount\n" +
+            "Display: #$externalDisplayId | Service: $svc$err"
     }
 
     private fun updateStatus(text: String) {
