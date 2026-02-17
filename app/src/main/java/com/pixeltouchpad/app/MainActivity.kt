@@ -42,7 +42,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnDiagnose: Button
     private lateinit var btnCopy: Button
     private lateinit var btnShare: Button
-    private lateinit var diagActionRow: View
     private var lastDiagnosticOutput: String? = null
 
     private val serviceConnection = object : ServiceConnection {
@@ -109,11 +108,11 @@ class MainActivity : AppCompatActivity() {
         btnDiagnose = findViewById(R.id.btnDiagnose)
         btnCopy = findViewById(R.id.btnCopy)
         btnShare = findViewById(R.id.btnShare)
-        diagActionRow = findViewById(R.id.diagActionRow)
 
         touchpadView.visibility = View.GONE
         btnDiagnose.visibility = View.GONE
-        diagActionRow.visibility = View.GONE
+        btnCopy.visibility = View.GONE
+        btnShare.visibility = View.GONE
 
         btnConnect.setOnClickListener { startSetup() }
         btnDiagnose.setOnClickListener { runDiagnose() }
@@ -266,14 +265,16 @@ class MainActivity : AppCompatActivity() {
                 lastDiagnosticOutput = result
                 runOnUiThread {
                     updateStatus(result)
-                    diagActionRow.visibility = View.VISIBLE
+                    btnCopy.visibility = View.VISIBLE
+                    btnShare.visibility = View.VISIBLE
                 }
             } catch (e: Exception) {
                 val error = "Diagnostika selhala: ${e.message}"
                 lastDiagnosticOutput = error
                 runOnUiThread {
                     updateStatus(error)
-                    diagActionRow.visibility = View.VISIBLE
+                    btnCopy.visibility = View.VISIBLE
+                    btnShare.visibility = View.VISIBLE
                 }
             }
         }.start()

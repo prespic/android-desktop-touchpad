@@ -11,98 +11,87 @@ import java.lang.reflect.Method
 /**
  * Shizuku UserService - runs with shell (ADB) privileges.
  *
- * Injection strategy priority:
- * 1. InputManagerGlobal.injectInputEvent (Android 14+/16)
- * 2. InputManager.getInstance().injectInputEvent (legacy)
- * 3. Instrumentation.sendPointerSync
- * 4. Shell "input" commands (tap only, no hover)
+ * Injection strategy priority (auto-detected at init):
+ * 1. InputManagerGlobal.injectInputEvent 3-arg (with targetUid)
+ * 2. InputManagerGlobal.injectInputEvent 2-arg
+ * 3. InputManager.getInstance() legacy
+ * 4. Shell "input" commands
  */
 class InputService : IInputService.Stub() {
 
     private val initLog = mutableListOf<String>()
 
-    // Active strategy
-    private enum class Strategy { INPUT_MANAGER_GLOBAL, INPUT_MANAGER_LEGACY, INSTRUMENTATION, SHELL }
-    private var activeStrategy = Strategy.SHELL
-
     // ---- Reflection handles ----
 
-    private var imInstance: Any? = null
-    private var injectMethod: Method? = null
+    private var imGlobalInstance: Any? = null
+    private var inject2Method: Method? = null  // (InputEvent, int)
+    private var inject3Method: Method? = null  // (InputEvent, int, int) - with targetUid
     private var setDisplayIdMethod: Method? = null
 
-    // Instrumentation
-    private var instrInstance: Any? = null
-    private var sendPointerSyncMethod: Method? = null
+    // Which inject approach to use for the external display
+    private var useInject3 = false
+    private var workingTargetUid = -1
+    private var inject3Tested = false
 
     init {
-        // Try setDisplayId (shared across strategies)
+        // setDisplayId (shared)
         try {
             setDisplayIdMethod = InputEvent::class.java.getDeclaredMethod(
-                "setDisplayId",
-                Int::class.javaPrimitiveType
+                "setDisplayId", Int::class.javaPrimitiveType
             )
-            initLog.add("✓ setDisplayId method found")
+            initLog.add("✓ setDisplayId found")
         } catch (e: Exception) {
             initLog.add("✗ setDisplayId: ${e.message}")
         }
 
-        // Strategy 1: InputManagerGlobal (Android 14+/16)
+        // InputManagerGlobal
         try {
             val imgClass = Class.forName("android.hardware.input.InputManagerGlobal")
-            imInstance = imgClass.getDeclaredMethod("getInstance").invoke(null)
+            imGlobalInstance = imgClass.getDeclaredMethod("getInstance").invoke(null)
+            initLog.add("✓ InputManagerGlobal OK")
 
-            // Try 2-arg version first: injectInputEvent(InputEvent, int)
-            injectMethod = imgClass.getDeclaredMethod(
-                "injectInputEvent",
-                InputEvent::class.java,
-                Int::class.javaPrimitiveType
-            )
-            activeStrategy = Strategy.INPUT_MANAGER_GLOBAL
-            initLog.add("✓ InputManagerGlobal.getInstance() OK")
-            initLog.add("✓ InputManagerGlobal.injectInputEvent(InputEvent, int) found")
-        } catch (e: Exception) {
-            initLog.add("✗ InputManagerGlobal: ${e.cause?.message ?: e.message}")
-        }
-
-        // Strategy 2: Legacy InputManager.getInstance()
-        if (activeStrategy == Strategy.SHELL) {
+            // 2-arg
             try {
-                imInstance = InputManager::class.java
-                    .getDeclaredMethod("getInstance")
-                    .invoke(null)
-                injectMethod = InputManager::class.java.getDeclaredMethod(
+                inject2Method = imgClass.getDeclaredMethod(
+                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType
+                )
+                initLog.add("✓ inject(Event, int) found")
+            } catch (e: Exception) {
+                initLog.add("✗ inject 2-arg: ${e.message}")
+            }
+
+            // 3-arg (with targetUid)
+            try {
+                inject3Method = imgClass.getDeclaredMethod(
                     "injectInputEvent",
                     InputEvent::class.java,
+                    Int::class.javaPrimitiveType,
                     Int::class.javaPrimitiveType
                 )
-                activeStrategy = Strategy.INPUT_MANAGER_LEGACY
-                initLog.add("✓ InputManager.getInstance() OK (legacy)")
+                initLog.add("✓ inject(Event, int, int) found")
             } catch (e: Exception) {
-                initLog.add("✗ InputManager legacy: ${e.cause?.message ?: e.message}")
+                initLog.add("✗ inject 3-arg: ${e.message}")
             }
-        }
+        } catch (e: Exception) {
+            initLog.add("✗ InputManagerGlobal: ${e.cause?.message ?: e.message}")
 
-        // Strategy 3: Instrumentation.sendPointerSync
-        if (activeStrategy == Strategy.SHELL) {
+            // Fallback: legacy InputManager
             try {
-                val instrClass = Class.forName("android.app.Instrumentation")
-                instrInstance = instrClass.getDeclaredConstructor().newInstance()
-                sendPointerSyncMethod = instrClass.getDeclaredMethod(
-                    "sendPointerSync",
-                    MotionEvent::class.java
+                val imClass = InputManager::class.java
+                imGlobalInstance = imClass.getDeclaredMethod("getInstance").invoke(null)
+                inject2Method = imClass.getDeclaredMethod(
+                    "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType
                 )
-                activeStrategy = Strategy.INSTRUMENTATION
-                initLog.add("✓ Instrumentation.sendPointerSync ready")
-            } catch (e: Exception) {
-                initLog.add("✗ Instrumentation: ${e.message}")
+                initLog.add("✓ InputManager legacy OK")
+            } catch (e2: Exception) {
+                initLog.add("✗ InputManager legacy: ${e2.cause?.message ?: e2.message}")
             }
         }
 
-        initLog.add("→ Active strategy: $activeStrategy")
+        initLog.add("→ inject2: ${inject2Method != null}, inject3: ${inject3Method != null}")
     }
 
-    // ---- Injection via InputManager/InputManagerGlobal ----
+    // ---- MotionEvent builder ----
 
     private fun buildMouseEvent(
         displayId: Int,
@@ -136,37 +125,58 @@ class InputService : IInputService.Stub() {
             1.0f, 1.0f, 0, 0,
             InputDevice.SOURCE_MOUSE, 0
         )
-        try {
-            setDisplayIdMethod?.invoke(event, displayId)
-        } catch (_: Exception) {}
+        try { setDisplayIdMethod?.invoke(event, displayId) } catch (_: Exception) {}
         return event
     }
 
-    private fun injectViaInputManager(
-        displayId: Int,
-        action: Int,
-        x: Float,
-        y: Float,
-        buttonState: Int = 0,
-        vScroll: Float = 0f
-    ): Boolean {
-        val im = imInstance ?: return false
-        val inject = injectMethod ?: return false
+    // ---- Injection methods ----
 
-        val event = buildMouseEvent(displayId, action, x, y, buttonState, vScroll)
-        return try {
-            val result = inject.invoke(im, event, 2) // 2 = INJECT_INPUT_EVENT_MODE_ASYNC
-            event.recycle()
-            result as? Boolean ?: false
-        } catch (e: Exception) {
-            event.recycle()
-            false
+    private fun injectEvent(displayId: Int, event: MotionEvent): Boolean {
+        val im = imGlobalInstance ?: return false
+
+        // Try 3-arg first if we know it works for this display
+        if (useInject3 && inject3Method != null) {
+            try {
+                val r = inject3Method!!.invoke(im, event, 2, workingTargetUid) as? Boolean ?: false
+                if (r) return true
+            } catch (_: Exception) {}
         }
+
+        // Try 2-arg
+        if (inject2Method != null) {
+            try {
+                val r = inject2Method!!.invoke(im, event, 2) as? Boolean ?: false
+                if (r) return true
+            } catch (_: Exception) {}
+        }
+
+        // If 2-arg fails on external display and we haven't tested 3-arg yet, try all targetUids
+        if (!inject3Tested && inject3Method != null && displayId != 0) {
+            inject3Tested = true
+            for (uid in listOf(-1, 0, 1000, 2000, 10000)) {
+                try {
+                    val testEvent = buildMouseEvent(displayId, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
+                    val r = inject3Method!!.invoke(im, testEvent, 2, uid) as? Boolean ?: false
+                    testEvent.recycle()
+                    if (r) {
+                        useInject3 = true
+                        workingTargetUid = uid
+                        initLog.add("✓ inject3 works with targetUid=$uid on display $displayId")
+                        // Re-inject the original event
+                        try {
+                            val r2 = inject3Method!!.invoke(im, event, 2, uid) as? Boolean ?: false
+                            if (r2) return true
+                        } catch (_: Exception) {}
+                    }
+                } catch (_: Exception) {}
+            }
+            initLog.add("✗ inject3 failed for all targetUids on display $displayId")
+        }
+
+        return false
     }
 
-    // ---- Injection via Instrumentation ----
-
-    private fun injectViaInstrumentation(
+    private fun inject(
         displayId: Int,
         action: Int,
         x: Float,
@@ -174,18 +184,10 @@ class InputService : IInputService.Stub() {
         buttonState: Int = 0,
         vScroll: Float = 0f
     ): Boolean {
-        val instr = instrInstance ?: return false
-        val send = sendPointerSyncMethod ?: return false
-
         val event = buildMouseEvent(displayId, action, x, y, buttonState, vScroll)
-        return try {
-            send.invoke(instr, event)
-            event.recycle()
-            true
-        } catch (e: Exception) {
-            event.recycle()
-            false
-        }
+        val result = injectEvent(displayId, event)
+        event.recycle()
+        return result
     }
 
     // ---- Shell fallback ----
@@ -196,7 +198,7 @@ class InputService : IInputService.Stub() {
             val finished = process.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             if (!finished) {
                 process.destroyForcibly()
-                return Pair(-1, "TIMEOUT after ${timeoutMs}ms")
+                return Pair(-1, "TIMEOUT")
             }
             val stdout = process.inputStream.bufferedReader().readText().trim()
             val stderr = process.errorStream.bufferedReader().readText().trim()
@@ -207,44 +209,20 @@ class InputService : IInputService.Stub() {
         }
     }
 
-    // ---- Unified inject method ----
-
-    private fun inject(
-        displayId: Int,
-        action: Int,
-        x: Float,
-        y: Float,
-        buttonState: Int = 0,
-        vScroll: Float = 0f
-    ): Boolean {
-        return when (activeStrategy) {
-            Strategy.INPUT_MANAGER_GLOBAL, Strategy.INPUT_MANAGER_LEGACY -> {
-                val ok = injectViaInputManager(displayId, action, x, y, buttonState, vScroll)
-                if (!ok) {
-                    // Try Instrumentation as fallback
-                    injectViaInstrumentation(displayId, action, x, y, buttonState, vScroll)
-                } else true
-            }
-            Strategy.INSTRUMENTATION -> {
-                injectViaInstrumentation(displayId, action, x, y, buttonState, vScroll)
-            }
-            Strategy.SHELL -> false
-        }
-    }
-
     // ---- AIDL implementation ----
 
     override fun moveCursor(displayId: Int, x: Float, y: Float) {
-        if (activeStrategy != Strategy.SHELL) {
-            inject(displayId, MotionEvent.ACTION_HOVER_MOVE, x, y)
+        val ok = inject(displayId, MotionEvent.ACTION_HOVER_MOVE, x, y)
+        if (!ok) {
+            // Shell can't do HOVER_MOVE reliably, but try mouse source
+            execShell("input -d $displayId mouse motionevent 7 ${x.toInt()} ${y.toInt()}")
         }
-        // Shell can't do HOVER_MOVE, skip
     }
 
     override fun click(displayId: Int, x: Float, y: Float) {
-        if (activeStrategy != Strategy.SHELL) {
-            inject(displayId, MotionEvent.ACTION_DOWN, x, y,
-                buttonState = MotionEvent.BUTTON_PRIMARY)
+        val downOk = inject(displayId, MotionEvent.ACTION_DOWN, x, y,
+            buttonState = MotionEvent.BUTTON_PRIMARY)
+        if (downOk) {
             try { Thread.sleep(16) } catch (_: Exception) {}
             inject(displayId, MotionEvent.ACTION_UP, x, y, buttonState = 0)
         } else {
@@ -253,145 +231,136 @@ class InputService : IInputService.Stub() {
     }
 
     override fun scroll(displayId: Int, x: Float, y: Float, vScroll: Float) {
-        if (activeStrategy != Strategy.SHELL) {
-            inject(displayId, MotionEvent.ACTION_SCROLL, x, y, vScroll = vScroll)
-        }
+        inject(displayId, MotionEvent.ACTION_SCROLL, x, y, vScroll = vScroll)
     }
 
     // ===========================================================
-    //  COMPREHENSIVE DIAGNOSTICS
+    //  DIAGNOSTICS
     // ===========================================================
 
     override fun diagnose(): String {
         val sb = StringBuilder()
         sb.appendLine("=== PixelTouchpad Diagnostics ===")
-        sb.appendLine("Timestamp: ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}")
-        sb.appendLine()
+        sb.appendLine("Time: ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())}")
 
-        // 1. Process & device
+        // 1. Device
+        sb.appendLine()
         sb.appendLine("-- 1. Device --")
-        sb.appendLine("UID: ${android.os.Process.myUid()} PID: ${android.os.Process.myPid()}")
-        sb.appendLine("SDK: ${android.os.Build.VERSION.SDK_INT} (${android.os.Build.VERSION.RELEASE})")
-        sb.appendLine("${android.os.Build.MODEL} (${android.os.Build.DEVICE})")
+        sb.appendLine("UID:${android.os.Process.myUid()} PID:${android.os.Process.myPid()}")
+        sb.appendLine("SDK:${android.os.Build.VERSION.SDK_INT} ${android.os.Build.MODEL}")
         val (_, idOut) = execShell("id")
         sb.appendLine("id: $idOut")
-        sb.appendLine()
 
-        // 2. Init log
+        // 2. Init
+        sb.appendLine()
         sb.appendLine("-- 2. Init --")
         initLog.forEach { sb.appendLine(it) }
+
+        // 3. InputManagerGlobal inject tests
         sb.appendLine()
+        sb.appendLine("-- 3. API Inject --")
 
-        // 3. Live injection tests
-        sb.appendLine("-- 3. Injection Tests --")
+        val img = imGlobalInstance
+        if (img != null) {
+            // 3a. 2-arg inject per display
+            sb.appendLine("3a. 2-arg inject(Event, mode=2):")
+            for (d in 0..2) {
+                val ev = buildMouseEvent(d, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
+                val r = try { inject2Method?.invoke(img, ev, 2) } catch (e: Exception) { "ERR:${e.cause?.message}" }
+                ev.recycle()
+                sb.appendLine("  d=$d HOVER: $r")
+            }
 
-        // 3a. InputManagerGlobal
-        sb.appendLine("3a. InputManagerGlobal:")
-        try {
-            val imgClass = Class.forName("android.hardware.input.InputManagerGlobal")
-            val img = imgClass.getDeclaredMethod("getInstance").invoke(null)
-            val imgInject = imgClass.getDeclaredMethod(
-                "injectInputEvent", InputEvent::class.java, Int::class.javaPrimitiveType
+            // 3b. 3-arg inject with various targetUids
+            if (inject3Method != null) {
+                sb.appendLine()
+                sb.appendLine("3b. 3-arg inject(Event, mode=2, uid):")
+                for (d in 0..1) {
+                    for (uid in listOf(-1, 0, 1000, 2000, 10000)) {
+                        val ev = buildMouseEvent(d, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
+                        val r = try {
+                            inject3Method!!.invoke(img, ev, 2, uid)
+                        } catch (e: Exception) {
+                            "ERR:${e.cause?.message?.take(40)}"
+                        }
+                        ev.recycle()
+                        sb.appendLine("  d=$d uid=$uid: $r")
+                    }
+                }
+            }
+
+            // 3c. Try different event sources
+            sb.appendLine()
+            sb.appendLine("3c. Sources on d=1:")
+            val sources = mapOf(
+                "MOUSE" to InputDevice.SOURCE_MOUSE,
+                "TOUCHSCREEN" to InputDevice.SOURCE_TOUCHSCREEN,
+                "TOUCHPAD" to InputDevice.SOURCE_TOUCHPAD,
+                "STYLUS" to InputDevice.SOURCE_STYLUS,
             )
-            for (displayId in listOf(0, 1, 2)) {
-                val event = buildMouseEvent(displayId, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
-                try {
-                    val r = imgInject.invoke(img, event, 2) // ASYNC
-                    sb.appendLine("  d=$displayId HOVER: $r")
-                } catch (e: Exception) {
-                    sb.appendLine("  d=$displayId HOVER: ERR ${e.cause?.message ?: e.message}")
-                }
-                event.recycle()
+            for ((name, src) in sources) {
+                val now = SystemClock.uptimeMillis()
+                val ev = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_MOVE,
+                    100f, 100f, 0)
+                ev.source = src
+                try { setDisplayIdMethod?.invoke(ev, 1) } catch (_: Exception) {}
+                val r = try { inject2Method?.invoke(img, ev, 2) } catch (e: Exception) { "ERR" }
+                ev.recycle()
+                sb.appendLine("  $name: $r")
             }
-            // Also test tap (DOWN+UP)
-            for (displayId in listOf(0, 1)) {
-                val downEvt = buildMouseEvent(displayId, MotionEvent.ACTION_DOWN, 100f, 100f,
-                    buttonState = MotionEvent.BUTTON_PRIMARY)
-                try {
-                    val r = imgInject.invoke(img, downEvt, 2)
-                    sb.appendLine("  d=$displayId DOWN: $r")
-                } catch (e: Exception) {
-                    sb.appendLine("  d=$displayId DOWN: ERR ${e.cause?.message ?: e.message}")
-                }
-                downEvt.recycle()
 
-                val upEvt = buildMouseEvent(displayId, MotionEvent.ACTION_UP, 100f, 100f)
-                try { imgInject.invoke(img, upEvt, 2) } catch (_: Exception) {}
-                upEvt.recycle()
+            // 3d. inject modes
+            sb.appendLine()
+            sb.appendLine("3d. Modes on d=1:")
+            for (mode in 0..2) {
+                val ev = buildMouseEvent(1, MotionEvent.ACTION_HOVER_MOVE, 100f, 100f)
+                val r = try { inject2Method?.invoke(img, ev, mode) } catch (e: Exception) { "ERR:${e.cause?.message?.take(30)}" }
+                ev.recycle()
+                sb.appendLine("  mode=$mode: $r")
             }
-        } catch (e: Exception) {
-            sb.appendLine("  FAILED: ${e.cause?.message ?: e.message}")
+        } else {
+            sb.appendLine("No InputManager instance")
         }
 
-        // 3b. Instrumentation
+        // 4. Shell
         sb.appendLine()
-        sb.appendLine("3b. Instrumentation:")
-        try {
-            val instrClass = Class.forName("android.app.Instrumentation")
-            val instr = instrClass.getDeclaredConstructor().newInstance()
-            val send = instrClass.getDeclaredMethod("sendPointerSync", MotionEvent::class.java)
-            for (displayId in listOf(0, 1)) {
-                val event = buildMouseEvent(displayId, MotionEvent.ACTION_HOVER_MOVE, 200f, 200f)
-                try {
-                    send.invoke(instr, event)
-                    sb.appendLine("  d=$displayId HOVER: OK")
-                } catch (e: Exception) {
-                    sb.appendLine("  d=$displayId HOVER: ${e.cause?.message ?: e.message}")
-                }
-                event.recycle()
-            }
-        } catch (e: Exception) {
-            sb.appendLine("  FAILED: ${e.message}")
-        }
-
-        // 3c. Shell
-        sb.appendLine()
-        sb.appendLine("3c. Shell commands:")
+        sb.appendLine("-- 4. Shell --")
         val shellTests = listOf(
-            "input tap 100 100",
             "input -d 0 tap 100 100",
             "input -d 1 tap 100 100",
-            "input motionevent DOWN 100 100",
-            "input motionevent MOVE 100 200",
-            "input motionevent UP 100 200",
+            "input -d 1 motionevent DOWN 100 100",
+            "input -d 1 motionevent MOVE 100 200",
+            "input -d 1 motionevent UP 100 200",
+            "input -d 1 mouse motionevent 7 100 100",
+            "input -d 1 mouse motionevent DOWN 100 100",
+            "input -d 1 mouse motionevent MOVE 100 200",
+            "input -d 1 mouse motionevent UP 100 200",
+            "input -d 1 mouse tap 100 100",
         )
         for (cmd in shellTests) {
             val (rc, out) = execShell(cmd)
-            val status = if (rc == 0 && out.isEmpty()) "OK" else "rc=$rc ${out.take(60)}"
-            sb.appendLine("  [$status] $cmd")
+            val s = if (rc == 0 && out.isEmpty()) "OK" else "rc=$rc ${out.take(50)}"
+            sb.appendLine("  [$s] $cmd")
         }
 
+        // 5. /dev/uinput
         sb.appendLine()
-
-        // 4. /dev/uinput
-        sb.appendLine("-- 4. /dev/uinput --")
-        val uinputFile = File("/dev/uinput")
-        sb.appendLine("exists: ${uinputFile.exists()} canWrite: ${uinputFile.canWrite()}")
-        val (_, lsU) = execShell("ls -la /dev/uinput 2>&1")
-        sb.appendLine(lsU)
+        sb.appendLine("-- 5. /dev/uinput --")
+        val uf = File("/dev/uinput")
+        sb.appendLine("exists:${uf.exists()} canWrite:${uf.canWrite()}")
         try {
-            val fd = java.io.FileOutputStream(uinputFile)
-            sb.appendLine("open for write: OK")
+            val fd = java.io.FileOutputStream(uf)
+            sb.appendLine("open: OK")
             fd.close()
         } catch (e: Exception) {
-            sb.appendLine("open for write: ${e.message}")
+            sb.appendLine("open: ${e.message}")
         }
 
-        sb.appendLine()
-
-        // 5. SELinux
-        sb.appendLine("-- 5. SELinux --")
-        val (_, enforce) = execShell("getenforce 2>&1")
-        sb.appendLine("getenforce: $enforce")
-        val (_, ctx) = execShell("cat /proc/self/attr/current 2>&1")
-        sb.appendLine("context: $ctx")
-
-        sb.appendLine()
-
         // 6. Displays
+        sb.appendLine()
         sb.appendLine("-- 6. Displays --")
-        val (_, dispInfo) = execShell("dumpsys display | grep -E 'mDisplayId|DisplayDeviceInfo' | head -15 2>&1")
-        dispInfo.lines().forEach { sb.appendLine("  ${it.trim()}") }
+        val (_, di) = execShell("dumpsys display | grep -E 'mDisplayId|uniqueId.*local' | head -10 2>&1")
+        di.lines().forEach { sb.appendLine("  ${it.trim()}") }
 
         sb.appendLine()
         sb.appendLine("=== END ===")
