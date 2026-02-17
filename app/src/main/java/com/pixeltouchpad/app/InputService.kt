@@ -150,30 +150,43 @@ class InputService : IInputService.Stub() {
      * by scanning /sys/class/input/
      */
     private fun findUhidEventDevice(): String? {
+        // Method 1: getevent -pl lists all input devices with names
         try {
-            val inputDir = File("/sys/class/input")
-            if (!inputDir.exists()) return null
-
-            for (entry in inputDir.listFiles() ?: emptyArray()) {
-                if (!entry.name.startsWith("event")) continue
-                val nameFile = File(entry, "device/name")
-                if (nameFile.exists()) {
-                    val devName = nameFile.readText().trim()
-                    if (devName == "PixelTouchpad Mouse") {
-                        return "/dev/input/${entry.name}"
+            val (rc, out) = execShell("getevent -pl 2>&1")
+            if (rc == 0) {
+                var currentDev: String? = null
+                for (line in out.lines()) {
+                    if (line.startsWith("add device") || line.contains("/dev/input/event")) {
+                        val match = Regex("/dev/input/event\\d+").find(line)
+                        if (match != null) currentDev = match.value
+                    }
+                    if (line.contains("PixelTouchpad Mouse") && currentDev != null) {
+                        return currentDev
                     }
                 }
             }
         } catch (_: Exception) {}
 
-        // Fallback: try shell
-        val (rc, out) = execShell("for d in /sys/class/input/event*; do " +
-                "name=\$(cat \$d/device/name 2>/dev/null); " +
-                "if [ \"\$name\" = 'PixelTouchpad Mouse' ]; then " +
-                "echo /dev/input/\$(basename \$d); fi; done")
-        if (rc == 0 && out.startsWith("/dev/input/event")) {
-            return out.lines().first().trim()
-        }
+        // Method 2: scan /sys via shell cat
+        try {
+            val (rc, out) = execShell("for d in /sys/class/input/event*; do " +
+                    "n=\$(cat \$d/device/name 2>/dev/null); " +
+                    "[ \"\$n\" = 'PixelTouchpad Mouse' ] && " +
+                    "echo /dev/input/\$(basename \$d); done")
+            if (rc == 0 && out.startsWith("/dev/input/event")) {
+                return out.lines().first().trim()
+            }
+        } catch (_: Exception) {}
+
+        // Method 3: find newest event device (heuristic - our device was just created)
+        try {
+            val (rc, out) = execShell("ls -t /dev/input/event* 2>/dev/null | head -1")
+            if (rc == 0 && out.startsWith("/dev/input/event")) {
+                initLog.add("eventDev: using newest device (heuristic): $out")
+                return out.trim()
+            }
+        } catch (_: Exception) {}
+
         return null
     }
 
@@ -201,8 +214,9 @@ class InputService : IInputService.Stub() {
         var rx = dx
         var ry = dy
         while (kotlin.math.abs(rx) > 0.5f || kotlin.math.abs(ry) > 0.5f) {
-            val sx = rx.coerceIn(-127f, 127f).toInt()
-            val sy = ry.coerceIn(-127f, 127f).toInt()
+            val sx = kotlin.math.round(rx).toInt().coerceIn(-127, 127)
+            val sy = kotlin.math.round(ry).toInt().coerceIn(-127, 127)
+            if (sx == 0 && sy == 0) break
             sendMouseReport(0, sx, sy)
             rx -= sx
             ry -= sy
