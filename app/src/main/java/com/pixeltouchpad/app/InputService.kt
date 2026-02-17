@@ -24,8 +24,8 @@ class InputService : IInputService.Stub() {
     private var uhidReady = false
 
     // Track previous absolute position to compute deltas
-    private var prevX = Float.NaN
-    private var prevY = Float.NaN
+    @Volatile private var prevX = Float.NaN
+    @Volatile private var prevY = Float.NaN
 
     companion object {
         // UHID event types
@@ -208,35 +208,40 @@ class InputService : IInputService.Stub() {
 
     // ---- AIDL implementation ----
 
-    @Synchronized
     override fun moveCursor(displayId: Int, x: Float, y: Float) {
-        if (uhidReady) {
-            if (!prevX.isNaN()) {
-                val dx = x - prevX
-                val dy = y - prevY
-                if (kotlin.math.abs(dx) > 0.1f || kotlin.math.abs(dy) > 0.1f) {
-                    uhidMove(dx, dy)
+        try {
+            if (uhidReady) {
+                val px = prevX
+                val py = prevY
+                if (!px.isNaN()) {
+                    val dx = x - px
+                    val dy = y - py
+                    if (kotlin.math.abs(dx) > 0.1f || kotlin.math.abs(dy) > 0.1f) {
+                        uhidMove(dx, dy)
+                    }
                 }
+                prevX = x
+                prevY = y
             }
-            prevX = x
-            prevY = y
-        }
+        } catch (_: Exception) {}
     }
 
-    @Synchronized
     override fun click(displayId: Int, x: Float, y: Float) {
-        if (uhidReady) {
-            uhidClick(1) // left button
-        } else {
-            execShell("input -d $displayId tap ${x.toInt()} ${y.toInt()}")
-        }
+        try {
+            if (uhidReady) {
+                uhidClick(1) // left button
+            } else {
+                execShell("input -d $displayId tap ${x.toInt()} ${y.toInt()}")
+            }
+        } catch (_: Exception) {}
     }
 
-    @Synchronized
     override fun scroll(displayId: Int, x: Float, y: Float, vScroll: Float) {
-        if (uhidReady) {
-            uhidScroll(vScroll.toInt().coerceIn(-10, 10))
-        }
+        try {
+            if (uhidReady) {
+                uhidScroll(vScroll.toInt().coerceIn(-10, 10))
+            }
+        } catch (_: Exception) {}
     }
 
     // ---- DIAGNOSTICS ----
@@ -318,7 +323,6 @@ class InputService : IInputService.Stub() {
         return sb.toString()
     }
 
-    @Synchronized
     override fun destroy() {
         try {
             if (uhidReady) {
