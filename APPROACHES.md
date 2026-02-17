@@ -45,6 +45,11 @@ Zařízení: Pixel 8 Pro, Android 16 (SDK 36), Shizuku UID 2000
     - Reporty se zapisují ale kernel je nepropaguje do input subsystému
 - **Dřívější úspěch**: V jednom buildu se kurzor pohyboval! Ale app zamrzla a crashla (synchronní AIDL + flush blokoval UI thread)
 - Po přidání `oneway` AIDL + odebrání flush() kurzor přestal reagovat
+- **BUG NALEZEN (2026-02-17)**: Nekonečná smyčka v `uhidMove()`!
+  - Když delta je 0.5–0.99, `toInt()` zaokrouhlí na 0, odečte se 0, smyčka běží donekonečna
+  - Diagnostika ukázala: `moveCursor calls: 2` ale `reports sent: 3,298,750`
+  - Všechny binder thready zůstaly zaseknuté v nekonečné smyčce
+  - Oprava: `kotlin.math.round()` místo `toInt()` + guard `if (sx==0 && sy==0) break`
 
 ### 6. /dev/uinput – Virtual Input Device
 - **Stav: NETESTOVÁNO (detekováno jako dostupné)**
