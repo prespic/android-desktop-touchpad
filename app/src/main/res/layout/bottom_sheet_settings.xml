@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:background="#1a1a2e">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Nastavení"
+        android:textSize="18sp"
+        android:textColor="#e94560"
+        android:textStyle="bold"
+        android:layout_marginBottom="20dp" />
+
+    <!-- Cursor sensitivity -->
+    <TextView
+        android:id="@+id/labelCursorSens"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Kurzor: 1.5"
+        android:textColor="#ffffff"
+        android:textSize="14sp"
+        android:layout_marginBottom="4dp" />
+
+    <SeekBar
+        android:id="@+id/seekCursorSens"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="16dp"
+        android:progressTint="#e94560"
+        android:thumbTint="#e94560" />
+
+    <!-- Scroll sensitivity -->
+    <TextView
+        android:id="@+id/labelScrollSens"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Scroll: 0.08"
+        android:textColor="#ffffff"
+        android:textSize="14sp"
+        android:layout_marginBottom="4dp" />
+
+    <SeekBar
+        android:id="@+id/seekScrollSens"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="24dp"
+        android:progressTint="#e94560"
+        android:thumbTint="#e94560" />
+
+    <!-- Buttons -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/btnDiagnose"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Diagnostika"
+            android:backgroundTint="#e94560" />
+
+        <Button
+            android:id="@+id/btnDisconnect"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Odpojit"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#16213e" />
+    </LinearLayout>
+</LinearLayout>

@@ -8,16 +8,20 @@ import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * TouchpadView - captures touch gestures on the phone screen and translates them
- * into cursor movement, clicks, and scroll events for the external display.
+ * TouchpadView - captures touch gestures and translates them to cursor/click/scroll events.
  *
  * Gestures:
- * - Single finger drag: move cursor (relative movement)
- * - Single finger tap (short touch, little movement): left click
- * - Two finger vertical drag: scroll
+ * - 1 finger drag: move cursor
+ * - 1 finger tap: left click
+ * - 2 finger tap (no movement): right click
+ * - 2 finger same direction: scroll
+ * - 2 finger pinch (distance changes): zoom (Ctrl+scroll)
+ * - 1 finger hold + 2nd finger added: drag (hold left button + move)
+ * - 3 finger swipe L/R/U/D: back / recent / app drawer / notifications
  */
 class TouchpadView @JvmOverloads constructor(
     context: Context,
@@ -25,13 +29,18 @@ class TouchpadView @JvmOverloads constructor(
     defStyleAttr: Int = 0
 ) : View(context, attrs, defStyleAttr) {
 
-    // --- Configuration ---
-    var sensitivity = 2.5f
-    var scrollSensitivity = 0.03f
-    private val tapMaxDuration = 200L   // ms
-    private val tapMaxDistance = 30f     // px on phone screen
+    enum class SwipeDirection { LEFT, RIGHT, UP, DOWN }
 
-    // --- Cursor state (absolute position on external display) ---
+    // --- Configuration ---
+    var sensitivity = 1.5f
+    var scrollSensitivity = 0.08f
+    private val tapMaxDuration = 200L   // ms
+    private val tapMaxDistance = 30f     // px
+    private val dragHoldTime = 250L     // ms before 1st finger counts as "hold"
+    private val threeFingerSwipeThreshold = 100f // px minimum swipe
+    private val pinchZoomThreshold = 30f // px change in finger distance
+
+    // --- Cursor state ---
     var cursorX = 0f
         private set
     var cursorY = 0f
@@ -46,19 +55,41 @@ class TouchpadView @JvmOverloads constructor(
     private var touchStartY = 0f
     private var touchStartTime = 0L
     private var activePointerCount = 0
+    private var maxPointerCountInGesture = 0
+    private var hasMoved = false
+
+    // Two-finger state
     private var isScrolling = false
     private var lastScrollY = 0f
-    private var hasMoved = false
+    private var twoFingerTapStartTime = 0L
+    private var twoFingerMoved = false
+    private var initialPinchDistance = 0f
+    private var lastPinchDistance = 0f
+    private var isPinching = false
+
+    // Tap-and-drag state
+    private var isDragMode = false
+    private var firstFingerStationary = false
+
+    // Three-finger state
+    private var isThreeFingerGesture = false
+    private var threeFingerStartX = 0f
+    private var threeFingerStartY = 0f
+    private var threeFingerLastX = 0f
+    private var threeFingerLastY = 0f
 
     // --- Callbacks ---
     var onCursorMove: ((x: Float, y: Float) -> Unit)? = null
     var onClick: ((x: Float, y: Float) -> Unit)? = null
+    var onRightClick: ((x: Float, y: Float) -> Unit)? = null
     var onScroll: ((x: Float, y: Float, vScroll: Float) -> Unit)? = null
+    var onPinchZoom: ((zoomDelta: Float) -> Unit)? = null
+    var onDragStart: (() -> Unit)? = null
+    var onDragEnd: (() -> Unit)? = null
+    var onThreeFingerSwipe: ((direction: SwipeDirection) -> Unit)? = null
 
     // --- Drawing ---
-    private val bgPaint = Paint().apply {
-        color = Color.parseColor("#1a1a2e")
-    }
+    private val bgPaint = Paint().apply { color = Color.parseColor("#1a1a2e") }
     private val gridPaint = Paint().apply {
         color = Color.parseColor("#16213e")
         strokeWidth = 1f
@@ -68,7 +99,7 @@ class TouchpadView @JvmOverloads constructor(
         style = Paint.Style.FILL
         isAntiAlias = true
     }
-    private val textPaint = Paint().apply {
+    private val statusPaint = Paint().apply {
         color = Color.parseColor("#e94560")
         textSize = 40f
         textAlign = Paint.Align.CENTER
@@ -80,10 +111,9 @@ class TouchpadView @JvmOverloads constructor(
         textAlign = Paint.Align.LEFT
         isAntiAlias = true
     }
-
-    // Active touch indicator position
     private var drawTouchX = -1f
     private var drawTouchY = -1f
+    private var gestureLabel = ""
 
     init {
         isClickable = true
@@ -107,8 +137,15 @@ class TouchpadView @JvmOverloads constructor(
                 touchStartY = event.y
                 touchStartTime = System.currentTimeMillis()
                 activePointerCount = 1
+                maxPointerCountInGesture = 1
                 isScrolling = false
+                isThreeFingerGesture = false
+                isDragMode = false
+                isPinching = false
                 hasMoved = false
+                twoFingerMoved = false
+                firstFingerStationary = false
+                gestureLabel = ""
                 drawTouchX = event.x
                 drawTouchY = event.y
                 invalidate()
@@ -116,71 +153,205 @@ class TouchpadView @JvmOverloads constructor(
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 activePointerCount = event.pointerCount
-                if (activePointerCount >= 2) {
-                    isScrolling = true
-                    lastScrollY = averageY(event)
+                maxPointerCountInGesture = maxOf(maxPointerCountInGesture, event.pointerCount)
+
+                if (activePointerCount == 2) {
+                    val elapsed = System.currentTimeMillis() - touchStartTime
+                    val dist = sqrt(
+                        (event.getX(0) - touchStartX).let { it * it } +
+                        (event.getY(0) - touchStartY).let { it * it }
+                    )
+
+                    // Check if first finger was held stationary = tap-and-drag
+                    if (elapsed > dragHoldTime && dist < tapMaxDistance && !hasMoved) {
+                        isDragMode = true
+                        gestureLabel = "DRAG"
+                        onDragStart?.invoke()
+                    } else {
+                        // Normal two-finger gesture (scroll / pinch / right-click tap)
+                        isScrolling = true
+                        lastScrollY = averageY(event)
+                        twoFingerTapStartTime = System.currentTimeMillis()
+                        twoFingerMoved = false
+                        initialPinchDistance = fingerDistance(event)
+                        lastPinchDistance = initialPinchDistance
+                        isPinching = false
+                    }
+                }
+
+                if (activePointerCount >= 3) {
+                    isScrolling = false
+                    isPinching = false
+                    isDragMode = false
+                    isThreeFingerGesture = true
+                    threeFingerStartX = averageX(event)
+                    threeFingerStartY = averageY(event)
+                    threeFingerLastX = threeFingerStartX
+                    threeFingerLastY = threeFingerStartY
+                    gestureLabel = "3-FINGER"
                 }
             }
 
             MotionEvent.ACTION_MOVE -> {
-                if (isScrolling && event.pointerCount >= 2) {
-                    // --- Two-finger scroll ---
-                    val currentY = averageY(event)
-                    val deltaY = currentY - lastScrollY
-                    lastScrollY = currentY
-
-                    if (kotlin.math.abs(deltaY) > 1f) {
-                        onScroll?.invoke(cursorX, cursorY, -deltaY * scrollSensitivity)
+                when {
+                    isThreeFingerGesture && event.pointerCount >= 3 -> {
+                        // Track latest average position for swipe direction
+                        threeFingerLastX = averageX(event)
+                        threeFingerLastY = averageY(event)
                     }
 
-                } else if (!isScrolling && event.pointerCount == 1) {
-                    // --- Single-finger cursor movement ---
-                    val dx = (event.x - lastTouchX) * sensitivity
-                    val dy = (event.y - lastTouchY) * sensitivity
-                    lastTouchX = event.x
-                    lastTouchY = event.y
+                    isDragMode -> {
+                        // Drag mode: move cursor with left button held
+                        if (event.pointerCount >= 2) {
+                            // Use the second finger for movement
+                            val idx = if (event.pointerCount > 1) 1 else 0
+                            val dx = (event.getX(idx) - lastTouchX) * sensitivity
+                            val dy = (event.getY(idx) - lastTouchY) * sensitivity
+                            lastTouchX = event.getX(idx)
+                            lastTouchY = event.getY(idx)
 
-                    if (kotlin.math.abs(dx) > 0.5f || kotlin.math.abs(dy) > 0.5f) {
-                        hasMoved = true
-                        cursorX = (cursorX + dx).coerceIn(0f, displayWidth - 1f)
-                        cursorY = (cursorY + dy).coerceIn(0f, displayHeight - 1f)
-                        onCursorMove?.invoke(cursorX, cursorY)
+                            if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
+                                cursorX = (cursorX + dx).coerceIn(0f, displayWidth - 1f)
+                                cursorY = (cursorY + dy).coerceIn(0f, displayHeight - 1f)
+                                onCursorMove?.invoke(cursorX, cursorY)
+                            }
+                        }
+                        drawTouchX = event.x
+                        drawTouchY = event.y
+                        invalidate()
                     }
 
-                    drawTouchX = event.x
-                    drawTouchY = event.y
-                    invalidate()
+                    isScrolling && event.pointerCount >= 2 -> {
+                        // Check for pinch vs scroll
+                        val currentDist = fingerDistance(event)
+                        val distDelta = currentDist - initialPinchDistance
+                        val currentY = averageY(event)
+                        val scrollDeltaY = currentY - lastScrollY
+
+                        if (!isPinching && abs(distDelta) > pinchZoomThreshold) {
+                            // Finger distance changed significantly → pinch zoom
+                            isPinching = true
+                            gestureLabel = "ZOOM"
+                        }
+
+                        if (isPinching) {
+                            val pinchDelta = currentDist - lastPinchDistance
+                            lastPinchDistance = currentDist
+                            if (abs(pinchDelta) > 2f) {
+                                twoFingerMoved = true
+                                onPinchZoom?.invoke(pinchDelta)
+                            }
+                        } else {
+                            // Normal scroll (both fingers same direction)
+                            lastScrollY = currentY
+                            if (abs(scrollDeltaY) > 1f) {
+                                twoFingerMoved = true
+                                gestureLabel = "SCROLL"
+                                onScroll?.invoke(cursorX, cursorY, -scrollDeltaY * scrollSensitivity)
+                            }
+                        }
+                    }
+
+                    !isScrolling && !isThreeFingerGesture && !isDragMode && event.pointerCount == 1 -> {
+                        // Single-finger cursor movement
+                        val dx = (event.x - lastTouchX) * sensitivity
+                        val dy = (event.y - lastTouchY) * sensitivity
+                        lastTouchX = event.x
+                        lastTouchY = event.y
+
+                        if (abs(dx) > 0.5f || abs(dy) > 0.5f) {
+                            hasMoved = true
+                            cursorX = (cursorX + dx).coerceIn(0f, displayWidth - 1f)
+                            cursorY = (cursorY + dy).coerceIn(0f, displayHeight - 1f)
+                            onCursorMove?.invoke(cursorX, cursorY)
+                        }
+
+                        drawTouchX = event.x
+                        drawTouchY = event.y
+                        invalidate()
+                    }
                 }
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
                 activePointerCount = event.pointerCount - 1
+
+                // When second finger lifts during drag, end drag
+                if (isDragMode && activePointerCount < 2) {
+                    // Keep drag mode active until full ACTION_UP
+                }
             }
 
             MotionEvent.ACTION_UP -> {
-                // Detect tap
-                if (!isScrolling && activePointerCount <= 1) {
-                    val elapsed = System.currentTimeMillis() - touchStartTime
-                    val distX = event.x - touchStartX
-                    val distY = event.y - touchStartY
-                    val dist = sqrt(distX * distX + distY * distY)
+                when {
+                    isThreeFingerGesture && maxPointerCountInGesture >= 3 -> {
+                        // Evaluate three-finger swipe direction
+                        val swipeDx = threeFingerLastX - threeFingerStartX
+                        val swipeDy = threeFingerLastY - threeFingerStartY
+                        val absDx = abs(swipeDx)
+                        val absDy = abs(swipeDy)
 
-                    if (elapsed < tapMaxDuration && dist < tapMaxDistance && !hasMoved) {
-                        onClick?.invoke(cursorX, cursorY)
+                        if (absDx > threeFingerSwipeThreshold || absDy > threeFingerSwipeThreshold) {
+                            if (absDx > absDy) {
+                                // Horizontal swipe
+                                if (swipeDx < 0) onThreeFingerSwipe?.invoke(SwipeDirection.LEFT)
+                                else onThreeFingerSwipe?.invoke(SwipeDirection.RIGHT)
+                            } else {
+                                // Vertical swipe
+                                if (swipeDy < 0) onThreeFingerSwipe?.invoke(SwipeDirection.UP)
+                                else onThreeFingerSwipe?.invoke(SwipeDirection.DOWN)
+                            }
+                        }
+                    }
+
+                    isDragMode -> {
+                        onDragEnd?.invoke()
+                    }
+
+                    maxPointerCountInGesture == 2 && !twoFingerMoved && !isPinching -> {
+                        // Two-finger tap = right click
+                        val elapsed = System.currentTimeMillis() - twoFingerTapStartTime
+                        if (elapsed < tapMaxDuration) {
+                            onRightClick?.invoke(cursorX, cursorY)
+                        }
+                    }
+
+                    !isScrolling && maxPointerCountInGesture <= 1 -> {
+                        // Single-finger tap = left click
+                        val elapsed = System.currentTimeMillis() - touchStartTime
+                        val distX = event.x - touchStartX
+                        val distY = event.y - touchStartY
+                        val dist = sqrt(distX * distX + distY * distY)
+
+                        if (elapsed < tapMaxDuration && dist < tapMaxDistance && !hasMoved) {
+                            onClick?.invoke(cursorX, cursorY)
+                        }
                     }
                 }
 
+                // Reset all state
                 activePointerCount = 0
+                maxPointerCountInGesture = 0
                 isScrolling = false
+                isThreeFingerGesture = false
+                isDragMode = false
+                isPinching = false
                 hasMoved = false
+                gestureLabel = ""
                 drawTouchX = -1f
                 drawTouchY = -1f
                 invalidate()
             }
 
             MotionEvent.ACTION_CANCEL -> {
+                if (isDragMode) onDragEnd?.invoke()
                 activePointerCount = 0
+                maxPointerCountInGesture = 0
                 isScrolling = false
+                isThreeFingerGesture = false
+                isDragMode = false
+                isPinching = false
+                gestureLabel = ""
                 drawTouchX = -1f
                 drawTouchY = -1f
                 invalidate()
@@ -189,12 +360,23 @@ class TouchpadView @JvmOverloads constructor(
         return true
     }
 
+    private fun averageX(event: MotionEvent): Float {
+        var sum = 0f
+        for (i in 0 until event.pointerCount) sum += event.getX(i)
+        return sum / event.pointerCount
+    }
+
     private fun averageY(event: MotionEvent): Float {
         var sum = 0f
-        for (i in 0 until event.pointerCount) {
-            sum += event.getY(i)
-        }
+        for (i in 0 until event.pointerCount) sum += event.getY(i)
         return sum / event.pointerCount
+    }
+
+    private fun fingerDistance(event: MotionEvent): Float {
+        if (event.pointerCount < 2) return 0f
+        val dx = event.getX(0) - event.getX(1)
+        val dy = event.getY(0) - event.getY(1)
+        return sqrt(dx * dx + dy * dy)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -203,18 +385,12 @@ class TouchpadView @JvmOverloads constructor(
         // Background
         canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgPaint)
 
-        // Grid lines
+        // Grid
         val gridSpacing = 80f
         var gx = gridSpacing
-        while (gx < width) {
-            canvas.drawLine(gx, 0f, gx, height.toFloat(), gridPaint)
-            gx += gridSpacing
-        }
+        while (gx < width) { canvas.drawLine(gx, 0f, gx, height.toFloat(), gridPaint); gx += gridSpacing }
         var gy = gridSpacing
-        while (gy < height) {
-            canvas.drawLine(0f, gy, width.toFloat(), gy, gridPaint)
-            gy += gridSpacing
-        }
+        while (gy < height) { canvas.drawLine(0f, gy, width.toFloat(), gy, gridPaint); gy += gridSpacing }
 
         // Touch indicator
         if (drawTouchX >= 0 && drawTouchY >= 0) {
@@ -224,14 +400,13 @@ class TouchpadView @JvmOverloads constructor(
             canvas.drawCircle(drawTouchX, drawTouchY, 20f, touchPaint)
         }
 
-        // Status text at top
-        val statusText = if (isScrolling) "⇕ SCROLL" else "TOUCHPAD"
-        canvas.drawText(statusText, width / 2f, 60f, textPaint)
+        // Gesture label
+        if (gestureLabel.isNotEmpty()) {
+            canvas.drawText(gestureLabel, width / 2f, 60f, statusPaint)
+        }
 
-        // Cursor coordinates at bottom
-        val coordText = "Cursor: %.0f, %.0f  |  Display: %.0f×%.0f".format(
-            cursorX, cursorY, displayWidth, displayHeight
-        )
+        // Cursor coordinates
+        val coordText = "%.0f, %.0f".format(cursorX, cursorY)
         canvas.drawText(coordText, 20f, height - 20f, coordPaint)
     }
 }

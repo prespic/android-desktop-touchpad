@@ -1,16 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="#121212">
 
+    <!-- Setup panel (shown before touchpad is active) -->
     <LinearLayout
+        android:id="@+id/setupPanel"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="match_parent"
         android:orientation="vertical"
         android:padding="16dp"
-        android:gravity="center">
+        android:gravity="center_horizontal">
 
         <TextView
             android:layout_width="wrap_content"
@@ -19,55 +20,21 @@
             android:textSize="24sp"
             android:textColor="#e94560"
             android:textStyle="bold"
-            android:layout_marginBottom="8dp" />
+            android:layout_marginTop="32dp"
+            android:layout_marginBottom="16dp" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center"
-            android:layout_marginBottom="8dp">
-
-            <Button
-                android:id="@+id/btnConnect"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Připojit"
-                android:backgroundTint="#0f3460" />
-
-            <Button
-                android:id="@+id/btnDiagnose"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Diagnostika"
-                android:layout_marginStart="8dp"
-                android:backgroundTint="#e94560"
-                android:visibility="gone" />
-
-            <Button
-                android:id="@+id/btnCopy"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Kopírovat"
-                android:layout_marginStart="8dp"
-                android:backgroundTint="#16213e"
-                android:visibility="gone" />
-
-            <Button
-                android:id="@+id/btnShare"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Sdílet"
-                android:layout_marginStart="8dp"
-                android:backgroundTint="#16213e"
-                android:visibility="gone" />
-        </LinearLayout>
+            android:text="Připojit"
+            android:backgroundTint="#0f3460"
+            android:layout_marginBottom="16dp" />
 
         <ScrollView
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1"
-            android:fillViewport="false">
+            android:layout_weight="1">
 
             <TextView
                 android:id="@+id/statusText"
@@ -83,11 +50,25 @@
         </ScrollView>
     </LinearLayout>
 
+    <!-- Touchpad (fullscreen, shown after connection) -->
     <com.pixeltouchpad.app.TouchpadView
         android:id="@+id/touchpadView"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
+        android:layout_height="match_parent"
         android:visibility="gone" />
 
-</LinearLayout>
+    <!-- Settings gear icon (overlaid on touchpad) -->
+    <ImageButton
+        android:id="@+id/btnSettings"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="8dp"
+        android:layout_marginEnd="8dp"
+        android:src="@android:drawable/ic_menu_manage"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="Nastavení"
+        android:alpha="0.4"
+        android:visibility="gone" />
+
+</FrameLayout>

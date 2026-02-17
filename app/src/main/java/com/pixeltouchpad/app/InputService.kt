@@ -30,6 +30,7 @@ class InputService : IInputService.Stub() {
     @Volatile private var moveCallCount = 0L
     @Volatile private var reportSentCount = 0L
     @Volatile private var lastSendError: String? = null
+    @Volatile private var isDragging = false
 
     // Track previous absolute position to compute deltas
     @Volatile private var prevX = Float.NaN
@@ -82,6 +83,7 @@ class InputService : IInputService.Stub() {
         private const val REL_Y = 1
         private const val REL_WHEEL = 8
         private const val BTN_LEFT = 272
+        private const val BTN_RIGHT = 274
         private const val SYN_REPORT = 0
     }
 
@@ -211,13 +213,14 @@ class InputService : IInputService.Stub() {
     }
 
     private fun uhidMove(dx: Float, dy: Float) {
+        val buttons = if (isDragging) 1 else 0
         var rx = dx
         var ry = dy
         while (kotlin.math.abs(rx) > 0.5f || kotlin.math.abs(ry) > 0.5f) {
             val sx = kotlin.math.round(rx).toInt().coerceIn(-127, 127)
             val sy = kotlin.math.round(ry).toInt().coerceIn(-127, 127)
             if (sx == 0 && sy == 0) break
-            sendMouseReport(0, sx, sy)
+            sendMouseReport(buttons, sx, sy)
             rx -= sx
             ry -= sy
         }
@@ -315,6 +318,72 @@ class InputService : IInputService.Stub() {
             }
         } catch (e: Exception) {
             lastSendError = "scroll: ${e.message}"
+        }
+    }
+
+    override fun rightClick(displayId: Int, x: Float, y: Float) {
+        try {
+            when (activeStrategy) {
+                Strategy.UHID -> {
+                    sendMouseReport(2, 0, 0) // bit 1 = BTN_RIGHT
+                    Thread.sleep(16)
+                    sendMouseReport(0, 0, 0)
+                }
+                Strategy.SENDEVENT -> sendeventClick(BTN_RIGHT)
+                Strategy.NONE -> {}
+            }
+        } catch (e: Exception) {
+            lastSendError = "rightClick: ${e.message}"
+        }
+    }
+
+    override fun startDrag(displayId: Int) {
+        try {
+            isDragging = true
+            when (activeStrategy) {
+                Strategy.UHID -> sendMouseReport(1, 0, 0) // hold left button
+                Strategy.SENDEVENT -> {
+                    val dev = uhidEventDev ?: return
+                    execShell("sendevent $dev $EV_KEY $BTN_LEFT 1 && sendevent $dev $EV_SYN $SYN_REPORT 0", 1000)
+                }
+                Strategy.NONE -> {}
+            }
+        } catch (e: Exception) {
+            lastSendError = "startDrag: ${e.message}"
+        }
+    }
+
+    override fun endDrag(displayId: Int) {
+        try {
+            isDragging = false
+            when (activeStrategy) {
+                Strategy.UHID -> sendMouseReport(0, 0, 0) // release
+                Strategy.SENDEVENT -> {
+                    val dev = uhidEventDev ?: return
+                    execShell("sendevent $dev $EV_KEY $BTN_LEFT 0 && sendevent $dev $EV_SYN $SYN_REPORT 0", 1000)
+                }
+                Strategy.NONE -> {}
+            }
+        } catch (e: Exception) {
+            lastSendError = "endDrag: ${e.message}"
+        }
+    }
+
+    override fun sendKeyEvent(displayId: Int, keyCode: Int) {
+        try {
+            val cmd = if (displayId > 0) "input -d $displayId keyevent $keyCode"
+                      else "input keyevent $keyCode"
+            execShell(cmd, 3000)
+        } catch (e: Exception) {
+            lastSendError = "sendKeyEvent($keyCode): ${e.message}"
+        }
+    }
+
+    override fun sendShellCommand(displayId: Int, command: String) {
+        try {
+            execShell(command, 5000)
+        } catch (e: Exception) {
+            lastSendError = "sendShellCommand: ${e.message}"
         }
     }
 

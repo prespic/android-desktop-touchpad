@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.os.Bundle
@@ -12,15 +13,24 @@ import android.os.IBinder
 import android.view.Display
 import android.view.View
 import android.widget.Button
+import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import rikka.shizuku.Shizuku
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val SHIZUKU_PERMISSION_CODE = 1001
+        private const val PREFS_NAME = "touchpad_prefs"
+        private const val KEY_CURSOR_SENSITIVITY = "cursor_sensitivity"
+        private const val KEY_SCROLL_SENSITIVITY = "scroll_sensitivity"
+        private const val DEFAULT_CURSOR_SENS = 1.5f
+        private const val DEFAULT_SCROLL_SENS = 0.08f
     }
 
     private var inputService: IInputService? = null
@@ -30,19 +40,17 @@ class MainActivity : AppCompatActivity() {
     private var externalWidth = 1920f
     private var externalHeight = 1080f
 
-    // Event counters for debugging
     private var moveCount = 0L
     private var clickCount = 0L
     private var scrollCount = 0L
     private var lastError: String? = null
 
+    private lateinit var prefs: SharedPreferences
     private lateinit var touchpadView: TouchpadView
     private lateinit var statusText: TextView
+    private lateinit var setupPanel: View
     private lateinit var btnConnect: Button
-    private lateinit var btnDiagnose: Button
-    private lateinit var btnCopy: Button
-    private lateinit var btnShare: Button
-    private var lastDiagnosticOutput: String? = null
+    private lateinit var btnSettings: ImageButton
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -54,7 +62,10 @@ class MainActivity : AppCompatActivity() {
         override fun onServiceDisconnected(name: ComponentName?) {
             inputService = null
             isServiceBound = false
-            runOnUiThread { updateStatus("Služba odpojena") }
+            runOnUiThread {
+                updateStatus("Služba odpojena")
+                showSetupPanel()
+            }
         }
     }
 
@@ -89,8 +100,7 @@ class MainActivity : AppCompatActivity() {
                 if (displayId == externalDisplayId) {
                     externalDisplayId = -1
                     updateStatus("Externí displej odpojen")
-                    touchpadView.visibility = View.GONE
-                    btnConnect.visibility = View.VISIBLE
+                    showSetupPanel()
                 }
             }
         }
@@ -102,60 +112,88 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+
         touchpadView = findViewById(R.id.touchpadView)
         statusText = findViewById(R.id.statusText)
+        setupPanel = findViewById(R.id.setupPanel)
         btnConnect = findViewById(R.id.btnConnect)
-        btnDiagnose = findViewById(R.id.btnDiagnose)
-        btnCopy = findViewById(R.id.btnCopy)
-        btnShare = findViewById(R.id.btnShare)
+        btnSettings = findViewById(R.id.btnSettings)
 
         touchpadView.visibility = View.GONE
-        btnDiagnose.visibility = View.GONE
-        btnCopy.visibility = View.GONE
-        btnShare.visibility = View.GONE
+        btnSettings.visibility = View.GONE
+
+        // Load persisted sensitivity
+        touchpadView.sensitivity = prefs.getFloat(KEY_CURSOR_SENSITIVITY, DEFAULT_CURSOR_SENS)
+        touchpadView.scrollSensitivity = prefs.getFloat(KEY_SCROLL_SENSITIVITY, DEFAULT_SCROLL_SENS)
 
         btnConnect.setOnClickListener { startSetup() }
-        btnDiagnose.setOnClickListener { runDiagnose() }
-        btnCopy.setOnClickListener { copyDiagnostics() }
-        btnShare.setOnClickListener { shareDiagnostics() }
+        btnSettings.setOnClickListener { openSettings() }
 
         Shizuku.addRequestPermissionResultListener(permissionResultListener)
-
         val dm = getSystemService(DisplayManager::class.java)
         dm.registerDisplayListener(displayListener, null)
 
-        // Touchpad callbacks with event counting
+        // --- Touchpad callbacks ---
+
         touchpadView.onCursorMove = { x, y ->
             moveCount++
-            try {
-                inputService?.moveCursor(externalDisplayId, x, y)
-            } catch (e: Exception) {
-                lastError = "Move: ${e.message}"
-            }
-            if (moveCount % 50 == 0L) {
-                runOnUiThread { updateEventCounter() }
-            }
+            try { inputService?.moveCursor(externalDisplayId, x, y) }
+            catch (e: Exception) { lastError = "Move: ${e.message}" }
+            if (moveCount % 50 == 0L) runOnUiThread { updateEventCounter() }
         }
 
         touchpadView.onClick = { x, y ->
             clickCount++
-            try {
-                inputService?.click(externalDisplayId, x, y)
-            } catch (e: Exception) {
-                lastError = "Click: ${e.message}"
-            }
+            try { inputService?.click(externalDisplayId, x, y) }
+            catch (e: Exception) { lastError = "Click: ${e.message}" }
             runOnUiThread { updateEventCounter() }
+        }
+
+        touchpadView.onRightClick = { x, y ->
+            try { inputService?.rightClick(externalDisplayId, x, y) }
+            catch (e: Exception) { lastError = "RClick: ${e.message}" }
         }
 
         touchpadView.onScroll = { x, y, vScroll ->
             scrollCount++
+            try { inputService?.scroll(externalDisplayId, x, y, vScroll) }
+            catch (e: Exception) { lastError = "Scroll: ${e.message}" }
+            if (scrollCount % 10 == 0L) runOnUiThread { updateEventCounter() }
+        }
+
+        touchpadView.onPinchZoom = { zoomDelta ->
+            // Convert pinch to scroll events (zoom = Ctrl+scroll in most apps)
+            // Positive delta = fingers apart = zoom in = scroll up
+            val scrollAmount = if (zoomDelta > 0) 1f else -1f
+            try { inputService?.scroll(externalDisplayId, 0f, 0f, scrollAmount) }
+            catch (e: Exception) { lastError = "Zoom: ${e.message}" }
+        }
+
+        touchpadView.onDragStart = {
+            try { inputService?.startDrag(externalDisplayId) }
+            catch (e: Exception) { lastError = "DragStart: ${e.message}" }
+        }
+
+        touchpadView.onDragEnd = {
+            try { inputService?.endDrag(externalDisplayId) }
+            catch (e: Exception) { lastError = "DragEnd: ${e.message}" }
+        }
+
+        touchpadView.onThreeFingerSwipe = { direction ->
             try {
-                inputService?.scroll(externalDisplayId, x, y, vScroll)
+                when (direction) {
+                    TouchpadView.SwipeDirection.LEFT ->
+                        inputService?.sendKeyEvent(externalDisplayId, 4)     // KEYCODE_BACK
+                    TouchpadView.SwipeDirection.RIGHT ->
+                        inputService?.sendKeyEvent(externalDisplayId, 187)   // KEYCODE_APP_SWITCH
+                    TouchpadView.SwipeDirection.UP ->
+                        inputService?.sendKeyEvent(externalDisplayId, 284)   // KEYCODE_ALL_APPS
+                    TouchpadView.SwipeDirection.DOWN ->
+                        inputService?.sendShellCommand(externalDisplayId, "cmd statusbar expand-notifications")
+                }
             } catch (e: Exception) {
-                lastError = "Scroll: ${e.message}"
-            }
-            if (scrollCount % 10 == 0L) {
-                runOnUiThread { updateEventCounter() }
+                lastError = "Swipe: ${e.message}"
             }
         }
 
@@ -163,6 +201,13 @@ class MainActivity : AppCompatActivity() {
             startSetup()
         } else {
             updateStatus("Spusť Shizuku a klikni na Připojit")
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && touchpadView.visibility == View.VISIBLE) {
+            enableFullscreenMode()
         }
     }
 
@@ -177,6 +222,14 @@ class MainActivity : AppCompatActivity() {
                 Shizuku.unbindUserService(userServiceArgs, serviceConnection, true)
             } catch (_: Exception) {}
         }
+    }
+
+    private fun enableFullscreenMode() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        val controller = WindowInsetsControllerCompat(window, window.decorView)
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+        controller.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
     }
 
     private fun startSetup() {
@@ -196,9 +249,7 @@ class MainActivity : AppCompatActivity() {
     private fun checkShizukuPermission(): Boolean {
         return try {
             Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
+        } catch (_: Exception) { false }
     }
 
     private fun bindInputService() {
@@ -211,7 +262,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onServiceReady() {
-        btnDiagnose.visibility = View.VISIBLE
         updateStatus("Služba připojena. Hledám externí displej...")
         detectExternalDisplay()
     }
@@ -220,7 +270,6 @@ class MainActivity : AppCompatActivity() {
         val dm = getSystemService(DisplayManager::class.java)
         val displays = dm.displays
 
-        // List all displays for debugging
         val displayInfo = displays.joinToString("\n") { d ->
             val mode = d.mode
             "  #${d.displayId}: ${d.name} (${mode.physicalWidth}×${mode.physicalHeight})"
@@ -238,17 +287,9 @@ class MainActivity : AppCompatActivity() {
             touchpadView.displayHeight = externalHeight
             touchpadView.resetCursor()
 
-            touchpadView.visibility = View.VISIBLE
-            btnConnect.visibility = View.GONE
-            updateStatus(
-                "Displej #$externalDisplayId (${externalWidth.toInt()}×${externalHeight.toInt()})\n" +
-                "Touchpad aktivní\n\n" +
-                "Pokud kurzor nereaguje, klikni Diagnostika\n\n" +
-                "Nalezené displeje:\n$displayInfo"
-            )
+            showTouchpad()
         } else {
-            touchpadView.visibility = View.GONE
-            btnConnect.visibility = View.VISIBLE
+            showSetupPanel()
             updateStatus(
                 "Žádný externí displej nenalezen.\n" +
                 "Připoj monitor přes USB-C.\n\n" +
@@ -257,51 +298,63 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showTouchpad() {
+        touchpadView.visibility = View.VISIBLE
+        setupPanel.visibility = View.GONE
+        btnSettings.visibility = View.VISIBLE
+        enableFullscreenMode()
+    }
+
+    private fun showSetupPanel() {
+        touchpadView.visibility = View.GONE
+        setupPanel.visibility = View.VISIBLE
+        btnSettings.visibility = View.GONE
+    }
+
+    private fun openSettings() {
+        val sheet = SettingsBottomSheet.newInstance(
+            touchpadView.sensitivity,
+            touchpadView.scrollSensitivity
+        )
+
+        sheet.onSensitivityChanged = { value ->
+            touchpadView.sensitivity = value
+            prefs.edit().putFloat(KEY_CURSOR_SENSITIVITY, value).apply()
+        }
+
+        sheet.onScrollSensitivityChanged = { value ->
+            touchpadView.scrollSensitivity = value
+            prefs.edit().putFloat(KEY_SCROLL_SENSITIVITY, value).apply()
+        }
+
+        sheet.onDiagnoseClicked = {
+            sheet.dismiss()
+            runDiagnose()
+        }
+
+        sheet.onDisconnectClicked = {
+            showSetupPanel()
+        }
+
+        sheet.show(supportFragmentManager, "settings")
+    }
+
     private fun runDiagnose() {
+        // Show setup panel for diagnostic output
+        showSetupPanel()
         updateStatus("Spouštím diagnostiku...")
         Thread {
             try {
                 val result = inputService?.diagnose(externalDisplayId) ?: "Služba není připojena"
-                lastDiagnosticOutput = result
-                runOnUiThread {
-                    updateStatus(result)
-                    btnCopy.visibility = View.VISIBLE
-                    btnShare.visibility = View.VISIBLE
-                }
+                runOnUiThread { updateStatus(result) }
             } catch (e: Exception) {
-                val error = "Diagnostika selhala: ${e.message}"
-                lastDiagnosticOutput = error
-                runOnUiThread {
-                    updateStatus(error)
-                    btnCopy.visibility = View.VISIBLE
-                    btnShare.visibility = View.VISIBLE
-                }
+                runOnUiThread { updateStatus("Diagnostika selhala: ${e.message}") }
             }
         }.start()
     }
 
-    private fun copyDiagnostics() {
-        val text = lastDiagnosticOutput ?: return
-        val clipboard = getSystemService(ClipboardManager::class.java)
-        clipboard.setPrimaryClip(ClipData.newPlainText("PixelTouchpad Diagnostics", text))
-        Toast.makeText(this, "Zkopírováno do schránky", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun shareDiagnostics() {
-        val text = lastDiagnosticOutput ?: return
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_SUBJECT, "PixelTouchpad Diagnostics")
-            putExtra(Intent.EXTRA_TEXT, text)
-        }
-        startActivity(Intent.createChooser(intent, "Sdílet diagnostiku"))
-    }
-
     private fun updateEventCounter() {
-        val err = if (lastError != null) "\nErr: $lastError" else ""
-        val svc = if (inputService != null) "connected" else "NULL"
-        statusText.text = "Move: $moveCount | Click: $clickCount | Scroll: $scrollCount\n" +
-            "Display: #$externalDisplayId | Service: $svc$err"
+        // Only show in setup panel (if visible)
     }
 
     private fun updateStatus(text: String) {
