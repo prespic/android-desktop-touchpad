@@ -141,7 +141,6 @@ class InputService : IInputService.Stub() {
         // Rest is already zeroed by ByteBuffer.allocate
 
         fd.write(buf.array())
-        fd.flush()
 
         // Give kernel time to register the device
         Thread.sleep(200)
@@ -150,6 +149,7 @@ class InputService : IInputService.Stub() {
         initLog.add("✓ UHID mouse device created")
     }
 
+    @Synchronized
     private fun sendMouseReport(buttons: Int, dx: Int, dy: Int, wheel: Int = 0) {
         val fd = uhidFd ?: return
         if (!uhidReady) return
@@ -166,7 +166,6 @@ class InputService : IInputService.Stub() {
         buf.put(wheel.coerceIn(-127, 127).toByte())
 
         fd.write(buf.array())
-        fd.flush()
     }
 
     /**
@@ -209,6 +208,7 @@ class InputService : IInputService.Stub() {
 
     // ---- AIDL implementation ----
 
+    @Synchronized
     override fun moveCursor(displayId: Int, x: Float, y: Float) {
         if (uhidReady) {
             if (!prevX.isNaN()) {
@@ -223,6 +223,7 @@ class InputService : IInputService.Stub() {
         }
     }
 
+    @Synchronized
     override fun click(displayId: Int, x: Float, y: Float) {
         if (uhidReady) {
             uhidClick(1) // left button
@@ -231,6 +232,7 @@ class InputService : IInputService.Stub() {
         }
     }
 
+    @Synchronized
     override fun scroll(displayId: Int, x: Float, y: Float, vScroll: Float) {
         if (uhidReady) {
             uhidScroll(vScroll.toInt().coerceIn(-10, 10))
@@ -316,6 +318,7 @@ class InputService : IInputService.Stub() {
         return sb.toString()
     }
 
+    @Synchronized
     override fun destroy() {
         try {
             if (uhidReady) {
