@@ -1,64 +1,37 @@
 # TODO – Další kroky
 
-## 🔴 P0 – Musí fungovat (opravit hned)
+## P0 – Musí fungovat
 
-### 1. Opravit injekci mouse eventů
-Kurzor na externím displeji nereaguje na pohyb. Postup:
-1. Spustit appku → kliknout **Diagnostika** → zkopírovat výstup
-2. Analyzovat:
-   - Pokud `InputManager.getInstance()` vrátí ✗ → API je na Android 16 blokované
-   - Pokud `injectInputEvent` vrátí false → oprávnění nestačí nebo špatný event formát
-   - Pokud shell fallback taky nefunguje → `input -d` příkaz neexistuje na Android 16
-3. Na základě diagnostiky zvolit opravu (viz alternativy v CLAUDE.md)
+### 1. Opravit pohyb kurzoru přes UHID
+UHID virtual mouse vytváří kurzor na externím displeji, ale pohyb nefunguje stabilně.
+Diagnostika v aktuální verzi testuje 6 metod najednou:
+1. UHID direct write (short 10-byte buffer)
+2. UHID direct write (full 4102-byte buffer)
+3. sendevent shell příkazy
+4. getevent read-back verification
+5. shell `input mouse` / `input touchscreen`
+6. Permissions a SELinux kontext
 
-### 2. Ověřit správný displayId
-- Diagnostika vypíše seznam nalezených displejů
-- displayId externího monitoru nemusí být 1 – může být libovolné číslo
-- Ověřit, že `Display.DEFAULT_DISPLAY` (0) je opravdu ten na telefonu
+Potřeba: spustit diagnostiku, zjistit který test skutečně pohne kurzorem, a ten použít.
 
-## 🟡 P1 – Důležité vylepšení
+### 2. Zvážit /dev/uinput jako alternativu
+- Dostupný a writable pro shell
+- Vyžaduje ioctl() → JNI wrapper nebo C helper binary
+- Stabilnější API než UHID pro virtuální myš
 
-### 3. Implementovat /dev/uinput jako alternativu
-Pokud InputManager API nefunguje na Android 16, /dev/uinput je nejspolehlivější cesta:
-- Vytvořit virtuální mouse device
-- Posílat EV_REL eventy (relativní pohyb) místo absolutních souřadnic
-- Referenční kód: https://gist.github.com/Xtr126/c5de3932490758f2cbac44f8a6c3206e
-- Bude potřeba JNI nebo spouštění C binárek přes shell
+## P1 – Důležité vylepšení
 
-### 4. Přidat pravé tlačítko myši
-- Long press (>500ms) = pravý klik
-- Nebo: tří-prstové ťuknutí = pravý klik
-- V InputService přidat `rightClick()` metodu s `BUTTON_SECONDARY`
+### 3. Pravé tlačítko myši
+- Long press = pravý klik, nebo tří-prstový tap
 
-### 5. Přidat vizuální feedback
-- Vibrace při kliknutí (krátký haptic feedback)
-- Animace na touchpadu při detekci tagu/scrollu
-- Indikátor připojení (zelená/červená tečka)
+### 4. Haptic feedback
+- Krátká vibrace při kliknutí
 
-## 🟢 P2 – Nice to have
+### 5. Citlivost kurzoru
+- Slider v UI pro sensitivity multiplier
 
-### 6. Nastavení v UI
-- Slider pro citlivost kurzoru
-- Slider pro rychlost scrollu
-- Toggle pro haptic feedback
-- Uložení preferencí do SharedPreferences
+## P2 – Nice to have
 
-### 7. Notifikace s quick controls
-- Persistent notification když je touchpad aktivní
-- Quick action pro reset pozice kurzoru
-- Quick action pro odpojení
-
-### 8. Automatické spuštění
-- Detekce připojení externího displeje → automaticky zobrazit touchpad
-- BroadcastReceiver pro display connected/disconnected
-
-### 9. Podpora gest
-- Tři prsty doleva/doprava = Alt+Tab (přepínání oken)
-- Tři prsty nahoru = zobrazit všechna okna
-- Pinch = zoom
-
-### 10. Release build
-- Nastavit signing config v build.gradle.kts
-- Vytvořit keystore pro release podpis
-- GitHub Actions workflow pro release APK
-- Automatické release přes GitHub tags
+### 6. Automatické spuštění při připojení monitoru
+### 7. Podpora gest (Alt+Tab, zoom)
+### 8. Release build + signing
