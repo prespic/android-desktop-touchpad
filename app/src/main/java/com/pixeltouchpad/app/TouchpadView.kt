@@ -9,6 +9,7 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.sqrt
 
 /**
@@ -59,6 +60,7 @@ class TouchpadView @JvmOverloads constructor(
     private var hasMoved = false
 
     // Two-finger state
+    // isScrolling = "a two-finger gesture is in progress" (scroll, pinch, or still undecided)
     private var isScrolling = false
     private var lastScrollY = 0f
     private var twoFingerTapStartTime = 0L
@@ -66,10 +68,26 @@ class TouchpadView @JvmOverloads constructor(
     private var initialPinchDistance = 0f
     private var lastPinchDistance = 0f
     private var isPinching = false
+    // Scroll vs pinch is decided once per gesture, then locked
+    private var twoFingerDecided = false
+    private var twoFingerStartX = 0f
+    private var twoFingerStartY = 0f
+    private val twoFingerSlop = 12f     // px of movement before deciding scroll vs pinch
+    // Sub-notch remainder carried between move events (otherwise slow scrolls are lost)
+    private var scrollAccumulator = 0f
 
     // Tap-and-drag state
     private var isDragMode = false
     private var firstFingerStationary = false
+    // Second finger landed after a hold: could be drag OR a slow-start scroll.
+    // Decided by which finger moves first.
+    private var isDragCandidate = false
+    private var firstFingerId = -1
+    private var firstFingerDownX = 0f
+    private var firstFingerDownY = 0f
+    private var secondFingerId = -1
+    private var secondFingerDownX = 0f
+    private var secondFingerDownY = 0f
 
     // Three-finger state
     private var isThreeFingerGesture = false
@@ -141,6 +159,7 @@ class TouchpadView @JvmOverloads constructor(
                 isScrolling = false
                 isThreeFingerGesture = false
                 isDragMode = false
+                isDragCandidate = false
                 isPinching = false
                 hasMoved = false
                 twoFingerMoved = false
@@ -162,26 +181,42 @@ class TouchpadView @JvmOverloads constructor(
                         (event.getY(0) - touchStartY).let { it * it }
                     )
 
-                    // Check if first finger was held stationary = tap-and-drag
+                    // Set up two-finger state in every case (scroll / pinch / right-click tap)
+                    lastScrollY = averageY(event)
+                    twoFingerStartX = averageX(event)
+                    twoFingerStartY = lastScrollY
+                    twoFingerTapStartTime = System.currentTimeMillis()
+                    twoFingerMoved = false
+                    twoFingerDecided = false
+                    scrollAccumulator = 0f
+                    initialPinchDistance = fingerDistance(event)
+                    lastPinchDistance = initialPinchDistance
+                    isPinching = false
+
+                    // First finger held stationary → maybe tap-and-drag, but fingers often
+                    // land one after the other when starting a scroll, so don't commit yet:
+                    // wait to see whether only the 2nd finger moves (drag) or both do (scroll).
                     if (elapsed > dragHoldTime && dist < tapMaxDistance && !hasMoved) {
-                        isDragMode = true
-                        gestureLabel = "DRAG"
-                        onDragStart?.invoke()
+                        isDragCandidate = true
+                        isScrolling = false
+                        val second = event.actionIndex
+                        val first = if (second == 0) 1 else 0
+                        firstFingerId = event.getPointerId(first)
+                        firstFingerDownX = event.getX(first)
+                        firstFingerDownY = event.getY(first)
+                        secondFingerId = event.getPointerId(second)
+                        secondFingerDownX = event.getX(second)
+                        secondFingerDownY = event.getY(second)
                     } else {
-                        // Normal two-finger gesture (scroll / pinch / right-click tap)
                         isScrolling = true
-                        lastScrollY = averageY(event)
-                        twoFingerTapStartTime = System.currentTimeMillis()
-                        twoFingerMoved = false
-                        initialPinchDistance = fingerDistance(event)
-                        lastPinchDistance = initialPinchDistance
-                        isPinching = false
                     }
                 }
 
                 if (activePointerCount >= 3) {
                     isScrolling = false
                     isPinching = false
+                    isDragCandidate = false
+                    if (isDragMode) onDragEnd?.invoke()
                     isDragMode = false
                     isThreeFingerGesture = true
                     threeFingerStartX = averageX(event)
@@ -200,11 +235,35 @@ class TouchpadView @JvmOverloads constructor(
                         threeFingerLastY = averageY(event)
                     }
 
+                    isDragCandidate && event.pointerCount >= 2 -> {
+                        val i1 = event.findPointerIndex(firstFingerId)
+                        val i2 = event.findPointerIndex(secondFingerId)
+                        if (i1 >= 0 && i2 >= 0) {
+                            val m1 = hypot(event.getX(i1) - firstFingerDownX, event.getY(i1) - firstFingerDownY)
+                            val m2 = hypot(event.getX(i2) - secondFingerDownX, event.getY(i2) - secondFingerDownY)
+                            if (m1 > twoFingerSlop) {
+                                // First finger moves too → it's a two-finger scroll/pinch
+                                isDragCandidate = false
+                                isScrolling = true
+                            } else if (m2 > tapMaxDistance) {
+                                // Only the second finger moves → real tap-and-drag
+                                isDragCandidate = false
+                                isDragMode = true
+                                gestureLabel = "DRAG"
+                                // Start from the 2nd finger's position so the cursor doesn't jump
+                                lastTouchX = event.getX(i2)
+                                lastTouchY = event.getY(i2)
+                                onDragStart?.invoke()
+                                invalidate()
+                            }
+                        }
+                    }
+
                     isDragMode -> {
                         // Drag mode: move cursor with left button held
                         if (event.pointerCount >= 2) {
                             // Use the second finger for movement
-                            val idx = if (event.pointerCount > 1) 1 else 0
+                            val idx = event.findPointerIndex(secondFingerId).let { if (it >= 0) it else 1 }
                             val dx = (event.getX(idx) - lastTouchX) * sensitivity
                             val dy = (event.getY(idx) - lastTouchY) * sensitivity
                             lastTouchX = event.getX(idx)
@@ -222,16 +281,30 @@ class TouchpadView @JvmOverloads constructor(
                     }
 
                     isScrolling && event.pointerCount >= 2 -> {
-                        // Check for pinch vs scroll
                         val currentDist = fingerDistance(event)
-                        val distDelta = currentDist - initialPinchDistance
+                        val currentX = averageX(event)
                         val currentY = averageY(event)
-                        val scrollDeltaY = currentY - lastScrollY
 
-                        if (!isPinching && abs(distDelta) > pinchZoomThreshold) {
-                            // Finger distance changed significantly → pinch zoom
-                            isPinching = true
-                            gestureLabel = "ZOOM"
+                        if (!twoFingerDecided) {
+                            // Decide ONCE whether this is a pinch or a scroll, by comparing how
+                            // much the finger spread changed vs. how much the fingers moved together.
+                            // (Before: any 30px spread change at any time flipped to "zoom", which
+                            // happens constantly during a normal scroll and killed it.)
+                            val spreadChange = abs(currentDist - initialPinchDistance)
+                            val centroidMove = hypot(currentX - twoFingerStartX, currentY - twoFingerStartY)
+                            if (spreadChange > pinchZoomThreshold && spreadChange > centroidMove * 1.5f) {
+                                twoFingerDecided = true
+                                isPinching = true
+                                lastPinchDistance = currentDist
+                                gestureLabel = "ZOOM"
+                            } else if (centroidMove > twoFingerSlop) {
+                                twoFingerDecided = true
+                                isPinching = false
+                                gestureLabel = "SCROLL"
+                                // lastScrollY still = start position, so the slop distance isn't lost
+                            } else {
+                                return true // still undecided, wait for more movement
+                            }
                         }
 
                         if (isPinching) {
@@ -242,12 +315,19 @@ class TouchpadView @JvmOverloads constructor(
                                 onPinchZoom?.invoke(pinchDelta)
                             }
                         } else {
-                            // Normal scroll (both fingers same direction)
+                            // Normal scroll (both fingers same direction).
+                            // The wheel only accepts whole notches, so accumulate the fractional
+                            // part instead of truncating it away on every event (that was why slow
+                            // scrolls did nothing and fast ones jumped).
+                            val scrollDeltaY = currentY - lastScrollY
                             lastScrollY = currentY
-                            if (abs(scrollDeltaY) > 1f) {
-                                twoFingerMoved = true
-                                gestureLabel = "SCROLL"
-                                onScroll?.invoke(cursorX, cursorY, -scrollDeltaY * scrollSensitivity)
+                            twoFingerMoved = true
+                            hasMoved = true
+                            scrollAccumulator += -scrollDeltaY * scrollSensitivity
+                            val notches = scrollAccumulator.toInt() // truncates toward zero
+                            if (notches != 0) {
+                                scrollAccumulator -= notches
+                                onScroll?.invoke(cursorX, cursorY, notches.toFloat())
                             }
                         }
                     }
@@ -275,6 +355,13 @@ class TouchpadView @JvmOverloads constructor(
 
             MotionEvent.ACTION_POINTER_UP -> {
                 activePointerCount = event.pointerCount - 1
+
+                // A finger lifted before we knew drag vs scroll: treat it as a finished
+                // two-finger gesture so the remaining finger doesn't make the cursor jump.
+                if (isDragCandidate) {
+                    isDragCandidate = false
+                    isScrolling = true
+                }
 
                 // When second finger lifts during drag, end drag
                 if (isDragMode && activePointerCount < 2) {
@@ -335,6 +422,7 @@ class TouchpadView @JvmOverloads constructor(
                 isScrolling = false
                 isThreeFingerGesture = false
                 isDragMode = false
+                isDragCandidate = false
                 isPinching = false
                 hasMoved = false
                 gestureLabel = ""
@@ -350,6 +438,7 @@ class TouchpadView @JvmOverloads constructor(
                 isScrolling = false
                 isThreeFingerGesture = false
                 isDragMode = false
+                isDragCandidate = false
                 isPinching = false
                 gestureLabel = ""
                 drawTouchX = -1f
